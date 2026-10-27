@@ -1,0 +1,16 @@
+[package]
+name = "icloud-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "icloud-drive-gui"
+path = "src/main.rs"
+
+[dependencies]
+adw = { package = "libadwaita", version = "0.7", features = ["v1_5"] }
+gtk = { package = "gtk4", version = "0.9", features = ["v4_14"] }
+icloud-ipc = { path = "../icloud-ipc" }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+zbus = "4.4"

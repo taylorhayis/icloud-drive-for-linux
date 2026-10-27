@@ -1,0 +1,12 @@
+[package]
+name = "icloud-mount"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fuser = "0.15"
+icloud-engine = { path = "../icloud-engine" }
+libc = "0.2"
+tokio = { version = "1", features = ["rt"] }
+tracing = "0.1"

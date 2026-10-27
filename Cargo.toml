@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/icloud-proto",
+    "crates/icloud-engine",
+    "crates/icloud-ipc",
+    "crates/icloud-mount",
+    "crates/icloud-cli",
+    "crates/icloud-gui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false

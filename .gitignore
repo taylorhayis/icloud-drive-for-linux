@@ -1,0 +1,5 @@
+/target
+*.session
+*.sqlite
+*.sqlite-*
+.DS_Store

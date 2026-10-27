@@ -1,0 +1,13 @@
+[Unit]
+Description=iCloud Drive
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/icloud-drive daemon
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

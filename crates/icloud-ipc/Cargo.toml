@@ -1,0 +1,9 @@
+[package]
+name = "icloud-ipc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+zbus = "4.4"
