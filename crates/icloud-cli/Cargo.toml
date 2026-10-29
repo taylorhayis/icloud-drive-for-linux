@@ -11,12 +11,9 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 dirs = "5"
-fuser = "0.15"
 icloud-engine = { path = "../icloud-engine" }
 icloud-ipc = { path = "../icloud-ipc" }
-icloud-mount = { path = "../icloud-mount" }
 icloud-proto = { path = "../icloud-proto" }
-libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }

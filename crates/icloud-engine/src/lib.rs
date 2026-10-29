@@ -9,11 +9,11 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use icloud_proto::{AuthStep, IcloudClient, ProtoError, SavedSession, ROOT_DRIVEWSID};
+use icloud_proto::{AuthStep, IcloudClient, ProtoError, RemoteKind, RemoteNode, SavedSession, ROOT_DRIVEWSID};
 use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
-pub use db::{AttentionKind, Node, NodeKind};
+pub use db::{ActivityRecord, AttentionKind, Node, NodeKind};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -105,6 +105,9 @@ pub enum FetchReason {
 pub struct Engine {
     db: Mutex<db::Db>,
     blobs: blobs::BlobStore,
+    /// Real folder in the home directory. Pinned and local files live here, so
+    /// they are still there when the service is not running.
+    library: PathBuf,
     client: tokio::sync::Mutex<IcloudClient>,
     allow_deletion: AtomicBool,
     status: Mutex<SyncStatus>,
@@ -120,6 +123,7 @@ impl Engine {
     pub fn open(
         database: &Path,
         blobs: &Path,
+        library: &Path,
         client: IcloudClient,
         allow_deletion: bool,
         poll_seconds: u32,
@@ -128,10 +132,12 @@ impl Engine {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::create_dir_all(blobs)?;
+        std::fs::create_dir_all(library)?;
         let db = db::Db::open(database)?;
         Ok(Self {
             db: Mutex::new(db),
             blobs: blobs::BlobStore::new(blobs),
+            library: library.to_path_buf(),
             client: tokio::sync::Mutex::new(client),
             allow_deletion: AtomicBool::new(allow_deletion),
             status: Mutex::new(SyncStatus::default()),
@@ -267,13 +273,29 @@ impl Engine {
             return Ok(());
         }
         self.db.lock().expect("db").dismiss_kind(AttentionKind::NeedsAuth)?;
+        self.adopt_library()?;
+        self.clear_empty_stubs()?;
         let mut queue = VecDeque::from([ROOT_DRIVEWSID.to_string()]);
         let mut seen = std::collections::HashSet::from([ROOT_DRIVEWSID.to_string()]);
+        let mut failed_downloads = std::collections::HashSet::new();
         let mut total_files: Option<u64> = None;
-        while let Some(drivewsid) = queue.pop_front() {
+        loop {
             if self.shutdown.is_cancelled() {
                 return Err(EngineError::Cancelled);
             }
+            let skipped: Vec<i64> = failed_downloads.iter().copied().collect();
+            let pending = self.db.lock().expect("db").next_incomplete_pin(&skipped)?;
+            if pending.is_none() && queue.is_empty() {
+                break;
+            }
+            if let Some(node) = pending {
+                if self.ensure_content(node.ino, FetchReason::Pin).await.is_err() {
+                    failed_downloads.insert(node.ino);
+                }
+            }
+            let Some(drivewsid) = queue.pop_front() else {
+                continue;
+            };
             let started = now_ms();
             let parent = self.db.lock().expect("db").ino_for_drivewsid(&drivewsid)?;
             let path = self.db.lock().expect("db").path_of(parent).unwrap_or_else(|_| "/".into());
@@ -284,21 +306,32 @@ impl Engine {
             };
             match listed {
                 Ok(listing) => {
-                    if drivewsid == ROOT_DRIVEWSID {
-                        total_files = listing.file_count.or(total_files);
-                    }
                     if let Some(doc) = listing.docwsid.filter(|doc| !doc.is_empty() && doc != "root") {
                         self.db.lock().expect("db").set_docwsid(&drivewsid, &doc)?;
                     }
-                    let (folders, changed) = self.db.lock().expect("db").apply_snapshot(
-                        parent,
-                        started,
-                        true,
-                        &listing.children,
-                    )?;
-                    for folder in folders {
-                        if seen.insert(folder.clone()) {
-                            queue.push_back(folder);
+                    let (_folders, changed) = self.ingest_listing(parent, started, &listing.children)?;
+                    self.materialize_synced(parent, &listing.children)?;
+                    let roots = self.db.lock().expect("db").sync_folders()?;
+                    let whole_drive = roots.iter().any(|root| normalize_drive_path(root) == "/");
+                    if whole_drive {
+                        if drivewsid == ROOT_DRIVEWSID {
+                            total_files = listing.file_count.or(total_files);
+                        }
+                    } else {
+                        total_files = None;
+                    }
+                    // Only the top-level names are listed until a folder is chosen.
+                    // A chosen folder, and everything inside it, is listed after that.
+                    for child in &listing.children {
+                        if child.kind != RemoteKind::Folder {
+                            continue;
+                        }
+                        let child_path = join_drive_path(&path, &child.name_local);
+                        if !path_is_synced(&child_path, &roots) {
+                            continue;
+                        }
+                        if seen.insert(child.drivewsid.clone()) {
+                            queue.push_back(child.drivewsid.clone());
                         }
                     }
                     if changed {
@@ -328,7 +361,7 @@ impl Engine {
             }
             self.report_index(&path, total_files);
         }
-        self.hydrate_pins().await?;
+        self.adopt_library()?;
         self.upload_dirty().await?;
         self.flush_trash().await?;
         let files = self.db.lock().expect("db").indexed_file_count().unwrap_or(0);
@@ -341,25 +374,13 @@ impl Engine {
         if node.kind == NodeKind::Directory {
             return Err(EngineError::IsDirectory);
         }
-        if node.complete {
-            if let Some(path) = &node.blob {
-                if Path::new(path).is_file() {
-                    return Ok(PathBuf::from(path));
-                }
-            }
-            if node.size == 0 {
-                let path = self.blobs.path_for(ino);
-                std::fs::write(&path, [])?;
-                return Ok(path);
-            }
-        }
-        if node.size == 0 {
-            let path = self.blobs.path_for(ino);
-            std::fs::write(&path, [])?;
-            self.db.lock().expect("db").mark_complete(ino, &path, 0)?;
-            return Ok(path);
+        if local_copy_is_ready(&node) {
+            return Ok(PathBuf::from(node.blob.clone().unwrap_or_default()));
         }
         let Some(docwsid) = node.docwsid.clone().filter(|id| !id.is_empty()) else {
+            if node.dirty {
+                return self.write_empty_kept_file(ino);
+            }
             return Err(EngineError::Message("this file has no iCloud id yet".into()));
         };
         if self.db.lock().expect("db").has_attention(AttentionKind::RemoteMissing, ino)? {
@@ -388,14 +409,10 @@ impl Engine {
                 .await
         };
         match download {
-            Ok(written) if written == node.size => {
-                let final_path = self.blobs.path_for(ino);
-                if let Some(parent) = final_path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::rename(&temp, &final_path)?;
-                self.db.lock().expect("db").mark_complete(ino, &final_path, written)?;
+            Ok(written) if node.size == 0 || written == node.size => {
+                let final_path = self.publish_kept_file(ino, &temp, written)?;
                 self.db.lock().expect("db").dismiss_path(AttentionKind::StalledDownload, &path)?;
+                self.note_activity("downloaded", &path, &format_bytes(written));
                 let _ = reason;
                 self.set_status(Phase::Idle, "Up to date", "", written, Some(written), 0, None);
                 Ok(final_path)
@@ -407,6 +424,7 @@ impl Engine {
                     &path,
                     &format!("download stopped at {written} of {} bytes", node.size),
                 )?;
+                self.note_activity("download_failed", &path, &format!("stopped at {}", format_bytes(written)));
                 Err(EngineError::Message("download was incomplete".into()))
             }
             Err(err) => {
@@ -425,51 +443,325 @@ impl Engine {
                     AttentionKind::StalledDownload
                 };
                 self.db.lock().expect("db").raise(kind, Some(ino), &path, &err.to_string())?;
+                self.note_activity("download_failed", &path, &err.to_string());
                 self.set_status(Phase::Error, &err.to_string(), &path, 0, Some(node.size), 0, None);
                 Err(err.into())
             }
         }
     }
 
+    pub fn sync_folders(&self) -> Result<Vec<String>> {
+        self.db.lock().expect("db").sync_folders()
+    }
+
+    /// Download every file under `path` into the home folder, or stop doing that.
+    /// `path` of `/` is the whole drive. Files land on disk only after the download finishes.
+    pub fn set_sync_folder(&self, path: &str, enabled: bool) -> Result<()> {
+        let path = normalize_drive_path(path);
+        if enabled {
+            let ino = if path == "/" {
+                std::fs::create_dir_all(&self.library)?;
+                db::ROOT_INO
+            } else {
+                let node = self.resolve(&path)?;
+                if node.kind != NodeKind::Directory {
+                    return Err(EngineError::NotADirectory);
+                }
+                if let Ok(dir) = self.library_file(&path) {
+                    std::fs::create_dir_all(dir)?;
+                }
+                node.ino
+            };
+            self.db.lock().expect("db").add_sync_folder(&path)?;
+            self.db.lock().expect("db").set_pin_tree(ino, true)?;
+        } else {
+            self.db.lock().expect("db").remove_sync_folder(&path)?;
+            let ino = if path == "/" {
+                Some(db::ROOT_INO)
+            } else {
+                match self.db.lock().expect("db").resolve(&path) {
+                    Ok(ino) => Some(ino),
+                    Err(EngineError::NotFound) => None,
+                    Err(err) => return Err(err),
+                }
+            };
+            let Some(ino) = ino else {
+                self.wake.notify_waiters();
+                return Ok(());
+            };
+            self.db.lock().expect("db").set_pin_tree(ino, false)?;
+            for root in self.db.lock().expect("db").sync_folders()? {
+                let root_ino = if root == "/" {
+                    db::ROOT_INO
+                } else {
+                    match self.db.lock().expect("db").resolve(&root) {
+                        Ok(ino) => ino,
+                        Err(EngineError::NotFound) => continue,
+                        Err(err) => return Err(err),
+                    }
+                };
+                self.db.lock().expect("db").set_pin_tree(root_ino, true)?;
+            }
+            self.evict_unpinned_subtree(ino)?;
+            if path == "/" {
+                prune_empty_dirs(&self.library, &self.library);
+            } else if let Ok(dir) = self.library_file(&path) {
+                prune_empty_dirs(&dir, &self.library);
+            }
+        }
+        let label = if path == "/" { "Entire iCloud Drive" } else { path.as_str() };
+        self.note_activity(if enabled { "sync_on" } else { "sync_off" }, label, "");
+        self.wake.notify_waiters();
+        Ok(())
+    }
+
+    pub fn activity(&self) -> Result<Vec<ActivityRecord>> {
+        self.db.lock().expect("db").recent_activity(200)
+    }
+
+    fn note_activity(&self, kind: &str, path: &str, detail: &str) {
+        let _ = self.db.lock().expect("db").record_activity(kind, path, detail);
+    }
+
     pub fn set_pin(&self, path: &str, pin: bool) -> Result<()> {
-        let ino = self.db.lock().expect("db").resolve(path)?;
-        self.db.lock().expect("db").set_pin_tree(ino, pin)?;
+        let path = normalize_drive_path(path);
+        let node = self.resolve(&path)?;
+        if pin && node.kind == NodeKind::Directory {
+            return self.set_sync_folder(&path, true);
+        }
+        if !pin && node.kind == NodeKind::Directory {
+            return self.set_sync_folder(&path, false);
+        }
+        self.db.lock().expect("db").set_pin_tree(node.ino, pin)?;
         if pin {
             self.wake.notify_waiters();
         } else {
-            self.evict_unpinned(ino)?;
+            self.evict_unpinned_subtree(node.ino)?;
         }
         Ok(())
     }
 
-    /// Drop cached bytes for a file that is no longer pinned and has no local edits.
-    /// Metadata stays, so the name remains a placeholder.
-    fn evict_unpinned(&self, ino: i64) -> Result<()> {
-        let node = self.db.lock().expect("db").node(ino)?;
-        if node.kind == NodeKind::Directory {
-            let children = self.db.lock().expect("db").children(ino)?;
-            for child in children {
-                self.evict_unpinned(child.ino)?;
+    /// Drop local copies under `ino` that are no longer pinned and have no edits.
+    /// Names stay in the search index.
+    fn evict_unpinned_subtree(&self, ino: i64) -> Result<()> {
+        let nodes = self.db.lock().expect("db").unpinned_local_files(ino)?;
+        for node in nodes {
+            if let Some(blob) = node.blob.as_deref() {
+                self.remove_kept_file(Path::new(blob));
             }
-            return Ok(());
+            if let Ok(drive_path) = self.db.lock().expect("db").path_of(node.ino) {
+                if let Ok(kept) = self.library_file(&drive_path) {
+                    self.remove_kept_file(&kept);
+                }
+            }
+            let _ = std::fs::remove_file(self.blobs.path_for(node.ino));
+            let _ = std::fs::remove_file(self.blobs.temp_for(node.ino));
+            self.db.lock().expect("db").forget_local_bytes(node.ino)?;
         }
-        if node.pin || node.dirty {
-            return Ok(());
-        }
-        if let Some(blob) = node.blob.as_deref() {
-            let _ = std::fs::remove_file(blob);
-        }
-        let _ = std::fs::remove_file(self.blobs.path_for(ino));
-        let _ = std::fs::remove_file(self.blobs.temp_for(ino));
-        self.db.lock().expect("db").forget_local_bytes(ino)?;
         Ok(())
+    }
+
+    /// Remove pinned zero-byte stand-ins so a photo viewer cannot open them, and download the real file.
+    fn clear_empty_stubs(&self) -> Result<()> {
+        let stubs = self.db.lock().expect("db").empty_stubs()?;
+        for node in stubs {
+            let empty = node.blob.as_deref().and_then(|path| std::fs::metadata(path).ok()).is_some_and(|meta| meta.is_file() && meta.len() == 0);
+            if empty {
+                if let Some(blob) = node.blob.as_deref() {
+                    self.remove_kept_file(Path::new(blob));
+                }
+                self.db.lock().expect("db").forget_local_bytes(node.ino)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Pin files, and create directories, for children that sit inside a chosen sync folder.
+    fn materialize_synced(&self, parent: i64, children: &[RemoteNode]) -> Result<()> {
+        let roots = self.db.lock().expect("db").sync_folders()?;
+        if roots.is_empty() {
+            return Ok(());
+        }
+        let parent_path = self.db.lock().expect("db").path_of(parent).unwrap_or_else(|_| "/".into());
+        for child in children {
+            let path = join_drive_path(&parent_path, &child.name_local);
+            if !path_is_synced(&path, &roots) {
+                continue;
+            }
+            if child.kind == RemoteKind::Folder {
+                if let Ok(dir) = self.library_file(&path) {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                continue;
+            }
+            let Some(node) = self.db.lock().expect("db").child(parent, &child.name_local)? else {
+                continue;
+            };
+            if !node.pin {
+                self.db.lock().expect("db").set_pinned_flag(node.ino, true)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Path of a kept file inside the home folder. The drive path is `/Photos/a.jpg`.
+    fn library_file(&self, drive_path: &str) -> Result<PathBuf> {
+        let mut out = self.library.clone();
+        let trimmed = drive_path.trim_matches('/');
+        if trimmed.is_empty() {
+            return Err(EngineError::InvalidName);
+        }
+        for part in trimmed.split('/') {
+            if part.is_empty() || part == "." || part == ".." {
+                return Err(EngineError::InvalidName);
+            }
+            out.push(part);
+        }
+        Ok(out)
+    }
+
+    fn write_empty_kept_file(&self, ino: i64) -> Result<PathBuf> {
+        let drive_path = self.db.lock().expect("db").path_of(ino)?;
+        let path = self.library_file(&drive_path)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, [])?;
+        self.db.lock().expect("db").mark_complete(ino, &path, 0)?;
+        Ok(path)
+    }
+
+    /// Move a downloaded or cached file into the home folder and remember that path.
+    fn publish_kept_file(&self, ino: i64, source: &Path, size: u64) -> Result<PathBuf> {
+        let drive_path = self.db.lock().expect("db").path_of(ino)?;
+        let dest = self.library_file(&drive_path)?;
+        if source != dest.as_path() {
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            if std::fs::rename(source, &dest).is_err() {
+                std::fs::copy(source, &dest)?;
+                let _ = std::fs::remove_file(source);
+            }
+        }
+        self.db.lock().expect("db").mark_complete(ino, &dest, size)?;
+        Ok(dest)
+    }
+
+    fn remove_kept_file(&self, path: &Path) {
+        let _ = std::fs::remove_file(path);
+        if !path.starts_with(&self.library) {
+            return;
+        }
+        let mut dir = path.parent();
+        while let Some(current) = dir {
+            if current == self.library {
+                break;
+            }
+            if std::fs::remove_dir(current).is_err() {
+                break;
+            }
+            dir = current.parent();
+        }
+    }
+
+    /// Notice files the user added or edited in the home folder while the service was away.
+    fn adopt_library(&self) -> Result<()> {
+        if directory_is_mounted(&self.library) {
+            return Ok(());
+        }
+        let mut dirs = vec![self.library.clone()];
+        while let Some(dir) = dirs.pop() {
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(kind) = entry.file_type() else {
+                    continue;
+                };
+                if kind.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                if !kind.is_file() {
+                    continue;
+                }
+                let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if name.starts_with('.') {
+                    continue;
+                }
+                let Ok(rel) = path.strip_prefix(&self.library) else {
+                    continue;
+                };
+                let drive = format!("/{}", rel.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/"));
+                let len = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+                let resolved = self.db.lock().expect("db").resolve(&drive);
+                match resolved {
+                    Ok(ino) => {
+                        let node = self.db.lock().expect("db").node(ino)?;
+                        if node.kind != NodeKind::File {
+                            continue;
+                        }
+                        let path_str = path.to_string_lossy();
+                        let same_place = node.blob.as_deref() == Some(path_str.as_ref());
+                        if same_place && node.size == len && node.complete {
+                            continue;
+                        }
+                        if len == 0 && !node.dirty && node.size == 0 && node.docwsid.as_ref().is_some_and(|id| !id.is_empty()) {
+                            continue;
+                        }
+                        self.db.lock().expect("db").mark_complete(ino, &path, len)?;
+                        if node.size != len || !node.complete {
+                            self.db.lock().expect("db").mark_dirty(ino)?;
+                            self.note_activity("local", &drive, "Edited on this computer");
+                        }
+                    }
+                    Err(EngineError::NotFound) => {
+                        let parent_path = match drive.rfind('/') {
+                            Some(0) | None => "/",
+                            Some(index) => &drive[..index],
+                        };
+                        let parent = self.ensure_dir_chain(parent_path)?;
+                        let ino = self.db.lock().expect("db").create(parent, name, NodeKind::File)?;
+                        self.db.lock().expect("db").mark_complete(ino, &path, len)?;
+                        self.db.lock().expect("db").mark_dirty(ino)?;
+                        self.note_activity("local", &drive, "Added on this computer");
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_dir_chain(&self, drive_path: &str) -> Result<i64> {
+        let trimmed = drive_path.trim_matches('/');
+        if trimmed.is_empty() {
+            return Ok(db::ROOT_INO);
+        }
+        let mut parent = db::ROOT_INO;
+        for part in trimmed.split('/') {
+            let part = clean_name(part)?;
+            if let Some(node) = self.db.lock().expect("db").child(parent, &part)? {
+                if node.kind != NodeKind::Directory {
+                    return Err(EngineError::NotADirectory);
+                }
+                parent = node.ino;
+                continue;
+            }
+            parent = self.db.lock().expect("db").create(parent, &part, NodeKind::Directory)?;
+        }
+        Ok(parent)
     }
 
     pub fn create_file(&self, parent: i64, name: &str) -> Result<Node> {
         let name = clean_name(name)?;
         let ino = self.db.lock().expect("db").create(parent, &name, NodeKind::File)?;
-        let path = self.blobs.path_for(ino);
-        std::fs::write(&path, [])?;
+        let path = self.write_empty_kept_file(ino)?;
         self.db.lock().expect("db").mark_complete(ino, &path, 0)?;
         self.db.lock().expect("db").mark_dirty(ino)?;
         self.getattr(ino)
@@ -489,12 +781,7 @@ impl Engine {
         let path = if let Some(path) = node.blob.clone() {
             PathBuf::from(path)
         } else {
-            let path = self.blobs.path_for(ino);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&path, [])?;
-            path
+            self.write_empty_kept_file(ino)?
         };
         let mut file = std::fs::OpenOptions::new().write(true).create(true).open(&path)?;
         use std::io::{Seek, SeekFrom, Write};
@@ -515,12 +802,7 @@ impl Engine {
         let path = if let Some(path) = node.blob.clone() {
             PathBuf::from(path)
         } else {
-            let path = self.blobs.path_for(ino);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&path, [])?;
-            path
+            self.write_empty_kept_file(ino)?
         };
         let file = std::fs::OpenOptions::new().write(true).create(true).open(&path)?;
         file.set_len(size)?;
@@ -585,7 +867,10 @@ impl Engine {
             let Some(src_blob) = src.blob.clone() else {
                 return Err(EngineError::Message("the new file has no contents".into()));
             };
-            let new_blob = self.blobs.path_for(dst.ino);
+            let new_blob = self.library_file(&self.db.lock().expect("db").path_of(dst.ino)?)?;
+            if let Some(parent) = new_blob.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
             std::fs::copy(&src_blob, &new_blob)?;
             std::fs::File::open(&new_blob)?.sync_all()?;
             match self.db.lock().expect("db").commit_replace(src.ino, dst.ino, &new_blob, src.size) {
@@ -635,7 +920,7 @@ impl Engine {
                     let node = self.db.lock().expect("db").node(ino)?;
                     let copy = self.db.lock().expect("db").fork_conflict_copy(ino)?;
                     if let Some(blob) = node.blob.clone() {
-                        let dest = self.blobs.path_for(copy);
+                        let dest = self.library_file(&self.db.lock().expect("db").path_of(copy)?)?;
                         if let Some(parent) = dest.parent() {
                             std::fs::create_dir_all(parent)?;
                         }
@@ -662,17 +947,6 @@ impl Engine {
         }
     }
 
-    async fn hydrate_pins(&self) -> Result<()> {
-        let pinned = self.db.lock().expect("db").incomplete_pins()?;
-        for node in pinned {
-            if self.shutdown.is_cancelled() {
-                break;
-            }
-            let _ = self.ensure_content(node.ino, FetchReason::Pin).await;
-        }
-        Ok(())
-    }
-
     async fn upload_dirty(&self) -> Result<()> {
         self.publish_directories().await?;
         let dirty = self.db.lock().expect("db").dirty_files()?;
@@ -689,6 +963,7 @@ impl Engine {
                     &path,
                     &err.to_string(),
                 )?;
+                self.note_activity("upload_failed", &path, &err.to_string());
                 continue;
             }
             let Some(blob) = node.blob.clone() else { continue };
@@ -714,6 +989,7 @@ impl Engine {
                 Ok(()) => {
                     self.db.lock().expect("db").clear_dirty(node.ino)?;
                     self.db.lock().expect("db").dismiss_path(AttentionKind::StalledUpload, &path)?;
+                    self.note_activity("uploaded", &path, &format_bytes(node.size));
                 }
                 Err(err) => {
                     self.db.lock().expect("db").raise(
@@ -722,6 +998,7 @@ impl Engine {
                         &path,
                         &err.to_string(),
                     )?;
+                    self.note_activity("upload_failed", &path, &err.to_string());
                 }
             }
         }
@@ -772,6 +1049,7 @@ impl Engine {
                     } else {
                         self.db.lock().expect("db").clear_dirty(node.ino)?;
                     }
+                    self.note_activity("uploaded", &path, "Created folder");
                 }
                 Err(err) => {
                     self.db.lock().expect("db").raise(
@@ -780,6 +1058,7 @@ impl Engine {
                         &path,
                         &err.to_string(),
                     )?;
+                    self.note_activity("upload_failed", &path, &err.to_string());
                 }
             }
         }
@@ -800,6 +1079,8 @@ impl Engine {
                 .rename_item(&drivewsid, &node.etag, &node.name)
                 .await?;
             self.db.lock().expect("db").set_name_apple(node.ino, &node.name)?;
+            let path = self.db.lock().expect("db").path_of(node.ino).unwrap_or_else(|_| node.name.clone());
+            self.note_activity("renamed", &path, &format!("Renamed from {}", node.name_apple));
         }
         if let Some(old_parent) = node.remote_parent.clone() {
             if !parent_id.is_empty() && old_parent != parent_id {
@@ -810,6 +1091,8 @@ impl Engine {
                     .move_item(&drivewsid, &node.etag, &parent_id)
                     .await?;
                 self.db.lock().expect("db").set_remote_parent(node.ino, &parent_id)?;
+                let path = self.db.lock().expect("db").path_of(node.ino).unwrap_or_else(|_| node.name.clone());
+                self.note_activity("moved", &path, "Moved on iCloud");
             }
         }
         Ok(())
@@ -864,6 +1147,46 @@ impl Engine {
         }
     }
 
+    /// Write one folder's names without holding the database lock for the whole folder.
+    /// A large folder must not freeze the mount.
+    fn ingest_listing(&self, parent: i64, started: i64, children: &[RemoteNode]) -> Result<(Vec<String>, bool)> {
+        let parent_drive = self.db.lock().expect("db").node(parent)?.drivewsid.unwrap_or_default();
+        let mut folders = Vec::new();
+        let mut changed = false;
+        for child in children {
+            if self.db.lock().expect("db").upsert_remote(parent, &parent_drive, child)? {
+                changed = true;
+            }
+            if child.kind == RemoteKind::Folder {
+                folders.push(child.drivewsid.clone());
+            }
+        }
+        let seen: std::collections::HashSet<&str> = children.iter().map(|child| child.drivewsid.as_str()).collect();
+        let local = self.db.lock().expect("db").children(parent)?;
+        for node in local {
+            let Some(drivewsid) = node.drivewsid.clone() else {
+                continue;
+            };
+            if seen.contains(drivewsid.as_str()) || node.last_synced_ms >= started {
+                continue;
+            }
+            let mut db = self.db.lock().expect("db");
+            if node.dirty {
+                let path = db.path_of(node.ino).unwrap_or_else(|_| node.name.clone());
+                db.raise(
+                    AttentionKind::Conflict,
+                    Some(node.ino),
+                    &path,
+                    "This file changed here and on iCloud",
+                )?;
+            } else {
+                db.remove_node(node.ino)?;
+                changed = true;
+            }
+        }
+        Ok((folders, changed))
+    }
+
     fn report_index(&self, path: &str, total_files: Option<u64>) {
         let files = self.db.lock().expect("db").indexed_file_count().unwrap_or(0);
         self.set_status(Phase::Indexing, "Indexing iCloud Drive", path, 0, None, files, total_files);
@@ -899,6 +1222,100 @@ impl Engine {
     }
 }
 
+pub fn normalize_drive_path(path: &str) -> String {
+    let trimmed = path.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        "/".into()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+pub fn path_is_synced(path: &str, roots: &[String]) -> bool {
+    let path = normalize_drive_path(path);
+    roots.iter().any(|root| {
+        let root = normalize_drive_path(root);
+        root == "/" || path == root || path.starts_with(&format!("{root}/"))
+    })
+}
+
+fn join_drive_path(parent: &str, name: &str) -> String {
+    if parent == "/" {
+        format!("/{name}")
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
+/// A file already on disk that is safe to open. An empty stand-in for a remote file is not.
+fn local_copy_is_ready(node: &Node) -> bool {
+    if node.kind != NodeKind::File {
+        return false;
+    }
+    let Some(path) = node.blob.as_deref() else {
+        return false;
+    };
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    if node.dirty {
+        return true;
+    }
+    if meta.len() == 0 && !node.bytes_fetched {
+        return false;
+    }
+    if node.size == 0 {
+        return node.bytes_fetched;
+    }
+    meta.len() == node.size
+}
+
+fn prune_empty_dirs(dir: &Path, library: &Path) {
+    if !dir.starts_with(library) {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            prune_empty_dirs(&entry.path(), library);
+        }
+    }
+    if dir != library {
+        let _ = std::fs::remove_dir(dir);
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit + 1 < UNITS.len() {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
+}
+
+fn directory_is_mounted(folder: &Path) -> bool {
+    let listed = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+    let display = folder.display().to_string();
+    let escaped = display.replace(' ', "\\040");
+    listed.lines().any(|line| {
+        line.split_whitespace()
+            .nth(1)
+            .is_some_and(|target| target == display || target == escaped)
+    })
+}
+
 fn clean_name(name: &str) -> Result<String> {
     if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
         return Err(EngineError::InvalidName);
@@ -911,4 +1328,57 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{local_copy_is_ready, path_is_synced, Node, NodeKind};
+
+    fn sample(bytes_fetched: bool, size: u64, blob: Option<&str>, dirty: bool) -> Node {
+        Node {
+            ino: 2,
+            parent: 1,
+            name: "a.jpg".into(),
+            name_apple: "a.jpg".into(),
+            remote_parent: None,
+            kind: NodeKind::File,
+            size,
+            mtime_ms: 0,
+            complete: true,
+            pin: true,
+            dirty,
+            blob: blob.map(str::to_string),
+            docwsid: Some("doc".into()),
+            drivewsid: None,
+            etag: String::new(),
+            revision: 1,
+            last_synced_ms: 0,
+            bytes_fetched,
+        }
+    }
+
+    #[test]
+    fn sync_roots_cover_children_and_the_whole_drive() {
+        let photos = vec!["/Photos".to_string()];
+        assert!(path_is_synced("/Photos", &photos));
+        assert!(path_is_synced("/Photos/a.jpg", &photos));
+        assert!(!path_is_synced("/Notes/a.txt", &photos));
+        assert!(path_is_synced("/Notes/a.txt", &["/".to_string()]));
+    }
+
+    #[test]
+    fn an_empty_listing_is_not_ready_to_open() {
+        let dir = std::env::temp_dir().join(format!("icloud-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.jpg");
+        std::fs::write(&path, []).unwrap();
+        let path = path.to_string_lossy().to_string();
+        assert!(!local_copy_is_ready(&sample(false, 0, Some(&path), false)));
+        assert!(local_copy_is_ready(&sample(true, 0, Some(&path), false)));
+        std::fs::write(&path, b"jpeg").unwrap();
+        assert!(local_copy_is_ready(&sample(true, 4, Some(&path), false)));
+        assert!(!local_copy_is_ready(&sample(true, 9, Some(&path), false)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

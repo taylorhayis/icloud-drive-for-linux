@@ -4,7 +4,6 @@ members = [
     "crates/icloud-proto",
     "crates/icloud-engine",
     "crates/icloud-ipc",
-    "crates/icloud-mount",
     "crates/icloud-cli",
     "crates/icloud-gui",
 ]

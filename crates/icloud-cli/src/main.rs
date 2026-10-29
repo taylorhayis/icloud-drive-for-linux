@@ -10,7 +10,7 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use icloud_engine::Engine;
 use icloud_ipc::{
-    AttentionSnapshot, SearchHit, ServiceProxy, StatusSnapshot, BUS_NAME, BUS_PATH,
+    ActivityEvent, AttentionSnapshot, FolderChoice, SearchHit, ServiceProxy, StatusSnapshot, BUS_NAME, BUS_PATH,
 };
 use icloud_proto::IcloudClient;
 use serde::Deserialize;
@@ -28,7 +28,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the mount and sync service.
+    /// Index iCloud Drive and download the folders chosen in the window.
     Daemon,
     /// Show sync status and items that need attention.
     Status,
@@ -46,8 +46,6 @@ enum Command {
     },
     /// Ask the service to refresh iCloud now.
     Sync,
-    /// Add Keep downloaded and Unpin to COSMIC Files, Dolphin, and GNOME Files.
-    InstallMenus,
     /// Follow the service log in the journal.
     Logs,
 }
@@ -56,6 +54,9 @@ enum Command {
 struct FileConfig {
     mount_point: Option<String>,
     allow_deletion: Option<bool>,
+    /// Kept so older config files still load. The file-manager menu is gone.
+    #[serde(default)]
+    #[allow(dead_code)]
     file_browser: Option<bool>,
     poll_seconds: Option<u32>,
     china: Option<bool>,
@@ -68,7 +69,6 @@ struct Paths {
     config: PathBuf,
     mount: PathBuf,
     allow_deletion: bool,
-    file_browser: bool,
     poll_seconds: u32,
     china: bool,
 }
@@ -95,7 +95,6 @@ async fn run(cli: Cli) -> Result<(), String> {
         Command::Search { query } => client_search(&query).await,
         Command::Pin { paths } => client_pin(&paths, true, cli.notify).await,
         Command::Unpin { paths } => client_pin(&paths, false, cli.notify).await,
-        Command::InstallMenus => install_menus(),
         Command::Sync => client_sync().await,
         Command::Logs => logs(),
     }
@@ -107,21 +106,26 @@ async fn daemon() -> Result<(), String> {
         Some(saved) => IcloudClient::from_saved(saved).map_err(|err| err.to_string())?,
         None => IcloudClient::new(paths.china).map_err(|err| err.to_string())?,
     };
+    detach_if_mounted(&paths.mount);
     let engine = Arc::new(
         Engine::open(
             &paths.database,
             &paths.blobs,
+            &paths.mount,
             client,
             paths.allow_deletion,
             paths.poll_seconds,
         )
         .map_err(|err| err.to_string())?,
     );
+    let (stop, mut stopped) = tokio::sync::watch::channel(false);
     let service = DaemonService {
         engine: Arc::clone(&engine),
         mount_point: paths.mount.display().to_string(),
         session_path: paths.session.clone(),
         config_path: paths.config.clone(),
+        runtime: tokio::runtime::Handle::current(),
+        stop: stop.clone(),
     };
     let connection = ConnectionBuilder::session()
         .map_err(|err| err.to_string())?
@@ -133,25 +137,17 @@ async fn daemon() -> Result<(), String> {
         .await
         .map_err(|err| err.to_string())?;
 
-    if let Err(err) = apply_file_browser(&paths.config, paths.file_browser) {
-        tracing::warn!("file manager menus were not updated: {err}");
+    if let Err(err) = menus::uninstall() {
+        tracing::warn!("file manager menus were not removed: {err}");
     }
 
     let tray_engine = Arc::clone(&engine);
     let conn_for_tray = connection.clone();
+    let tray_stop = stop.clone();
     tokio::spawn(async move {
-        if let Err(err) = tray::run(conn_for_tray, tray_engine).await {
+        if let Err(err) = tray::run(conn_for_tray, tray_engine, tray_stop).await {
             tracing::warn!("panel icon is unavailable: {err}");
         }
-    });
-
-    let mount_engine = Arc::clone(&engine);
-    let mount_point = paths.mount.clone();
-    let rt = tokio::runtime::Handle::current();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let result = icloud_mount::mount_blocking(mount_engine, &mount_point, rt);
-        let _ = tx.send(result);
     });
 
     let engine_loop = Arc::clone(&engine);
@@ -159,16 +155,36 @@ async fn daemon() -> Result<(), String> {
         engine_loop.run_until_shutdown().await;
     });
 
-    wait_for_stop().await;
+    wait_for_stop(&mut stopped).await;
+    if let Ok(iface) = connection.object_server().interface::<_, DaemonService>(BUS_PATH).await {
+        let _ = DaemonService::closing(iface.signal_context()).await;
+    }
     engine.shutdown();
-    let mount = paths.mount.clone();
-    let _ = std::process::Command::new("fusermount3").args(["-u", &mount.display().to_string()]).status();
-    let _ = rx.recv_timeout(std::time::Duration::from_secs(5));
     drop(connection);
     Ok(())
 }
 
-async fn wait_for_stop() {
+/// An older build mounted this folder. Detach that mount so the real directory
+/// stays in place when this process exits.
+fn detach_if_mounted(folder: &std::path::Path) {
+    let listed = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+    let display = folder.display().to_string();
+    let escaped = display.replace(' ', "\\040");
+    let mounted = listed.lines().any(|line| {
+        line.split_whitespace().nth(1).is_some_and(|target| target == display || target == escaped)
+    });
+    if !mounted {
+        return;
+    }
+    let _ = std::process::Command::new("fusermount3").args(["-u", &display]).status();
+    let listed = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+    if listed.lines().any(|line| line.split_whitespace().nth(1).is_some_and(|target| target == display || target == escaped))
+    {
+        let _ = std::process::Command::new("fusermount3").args(["-uz", &display]).status();
+    }
+}
+
+async fn wait_for_stop(stopped: &mut tokio::sync::watch::Receiver<bool>) {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
@@ -177,6 +193,9 @@ async fn wait_for_stop() {
                 signal.recv().await;
             }
         } => {}
+        result = stopped.wait_for(|stop| *stop) => {
+            let _ = result;
+        }
     }
 }
 
@@ -185,6 +204,9 @@ struct DaemonService {
     mount_point: String,
     session_path: PathBuf,
     config_path: PathBuf,
+    /// D-Bus methods run outside this runtime. Apple requests have to be spawned back onto it.
+    runtime: tokio::runtime::Handle,
+    stop: tokio::sync::watch::Sender<bool>,
 }
 
 #[interface(name = "dev.icloud_drive.Service")]
@@ -219,6 +241,20 @@ impl DaemonService {
             .collect()
     }
 
+    fn activity(&self) -> Vec<ActivityEvent> {
+        self.engine
+            .activity()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|event| ActivityEvent {
+                at_ms: event.at_ms,
+                kind: event.kind,
+                path: event.path,
+                detail: event.detail,
+            })
+            .collect()
+    }
+
     fn search(&self, query: &str) -> Vec<SearchHit> {
         self.engine
             .search(query)
@@ -240,24 +276,72 @@ impl DaemonService {
             .collect()
     }
 
+    fn child_folders(&self, path: &str) -> Vec<FolderChoice> {
+        let path = icloud_engine::normalize_drive_path(path);
+        let roots = self.engine.sync_folders().unwrap_or_default();
+        let Ok(node) = self.engine.resolve(&path) else {
+            return Vec::new();
+        };
+        if node.kind != icloud_engine::NodeKind::Directory {
+            return Vec::new();
+        }
+        self.engine
+            .readdir(node.ino)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|child| child.kind == icloud_engine::NodeKind::Directory)
+            .filter_map(|child| {
+                let child_path = if path == "/" {
+                    format!("/{}", child.name)
+                } else {
+                    format!("{path}/{}", child.name)
+                };
+                Some(FolderChoice {
+                    name: child.name,
+                    synced: roots.iter().any(|root| root == &child_path),
+                    included: icloud_engine::path_is_synced(&child_path, &roots),
+                    path: child_path,
+                })
+            })
+            .collect()
+    }
+
+    fn sync_folders(&self) -> Vec<String> {
+        self.engine.sync_folders().unwrap_or_default()
+    }
+
+    fn set_sync_folder(&self, path: &str, enabled: bool) -> zbus::fdo::Result<()> {
+        self.engine
+            .set_sync_folder(path, enabled)
+            .map_err(|err| zbus::fdo::Error::Failed(err.to_string()))
+    }
+
     async fn begin_sign_in(&self, apple_id: &str, password: &str) -> zbus::fdo::Result<String> {
-        self.auth_call(self.engine.sign_in(apple_id, password).await).await
+        let engine = Arc::clone(&self.engine);
+        let apple_id = apple_id.to_string();
+        let password = password.to_string();
+        self.spawn_auth(async move { engine.sign_in(&apple_id, &password).await }).await
     }
 
     async fn submit_code(&self, code: &str) -> zbus::fdo::Result<String> {
-        self.auth_call(self.engine.submit_code(code).await).await
+        let engine = Arc::clone(&self.engine);
+        let code = code.to_string();
+        self.spawn_auth(async move { engine.submit_code(&code).await }).await
     }
 
     async fn request_sms(&self) -> zbus::fdo::Result<String> {
-        self.auth_call(self.engine.request_sms().await).await
+        let engine = Arc::clone(&self.engine);
+        self.spawn_auth(async move { engine.request_sms().await }).await
     }
 
     async fn accept_terms(&self) -> zbus::fdo::Result<String> {
-        self.auth_call(self.engine.accept_terms().await).await
+        let engine = Arc::clone(&self.engine);
+        self.spawn_auth(async move { engine.accept_terms().await }).await
     }
 
     async fn request_device_approval(&self) -> zbus::fdo::Result<String> {
-        self.auth_call(self.engine.request_device_approval().await).await
+        let engine = Arc::clone(&self.engine);
+        self.spawn_auth(async move { engine.request_device_approval().await }).await
     }
 
     fn set_pinned(&self, path: &str, pinned: bool) -> zbus::fdo::Result<()> {
@@ -276,14 +360,6 @@ impl DaemonService {
         self.engine.allow_deletion()
     }
 
-    fn set_file_browser(&self, enabled: bool) -> zbus::fdo::Result<()> {
-        apply_file_browser(&self.config_path, enabled).map_err(|err| zbus::fdo::Error::Failed(err))
-    }
-
-    fn file_browser(&self) -> bool {
-        file_browser_enabled(&self.config_path)
-    }
-
     fn resolve_attention(&self, id: i64, action: &str) -> zbus::fdo::Result<()> {
         self.engine
             .resolve_attention(id, action)
@@ -298,25 +374,51 @@ impl DaemonService {
     fn mount_point(&self) -> String {
         self.mount_point.clone()
     }
+
+    fn quit(&self) {
+        let _ = self.stop.send(true);
+    }
+
+    #[zbus(signal)]
+    async fn closing(ctxt: &zbus::object_server::SignalContext<'_>) -> zbus::Result<()>;
 }
 
 impl DaemonService {
-    async fn auth_call(&self, result: icloud_engine::Result<icloud_proto::AuthStep>) -> zbus::fdo::Result<String> {
-        let step = result.map_err(|err| zbus::fdo::Error::Failed(err.to_string()))?;
-        if matches!(step, icloud_proto::AuthStep::SignedIn) {
-            let saved = self.engine.export_session().await;
-            if let Ok(bytes) = serde_json::to_vec(&saved) {
-                let _ = store_session(&self.session_path, &bytes);
-            }
-        }
-        Ok(match step {
-            icloud_proto::AuthStep::SignedIn => "signed_in".into(),
-            icloud_proto::AuthStep::NeedsCode => "needs_code".into(),
-            icloud_proto::AuthStep::NeedsTerms => "needs_terms".into(),
-            icloud_proto::AuthStep::NeedsDeviceApproval => "needs_device".into(),
-            icloud_proto::AuthStep::Failed(message) => format!("failed:{message}"),
-        })
+    async fn spawn_auth(
+        &self,
+        step: impl std::future::Future<Output = icloud_engine::Result<icloud_proto::AuthStep>> + Send + 'static,
+    ) -> zbus::fdo::Result<String> {
+        let engine = Arc::clone(&self.engine);
+        let session_path = self.session_path.clone();
+        self.runtime
+            .spawn(async move {
+                let step = step.await;
+                finish_auth(&engine, &session_path, step).await
+            })
+            .await
+            .map_err(|err| zbus::fdo::Error::Failed(format!("sign-in task failed: {err}")))?
     }
+}
+
+async fn finish_auth(
+    engine: &Engine,
+    session_path: &std::path::Path,
+    result: icloud_engine::Result<icloud_proto::AuthStep>,
+) -> zbus::fdo::Result<String> {
+    let step = result.map_err(|err| zbus::fdo::Error::Failed(err.to_string()))?;
+    if matches!(step, icloud_proto::AuthStep::SignedIn) {
+        let saved = engine.export_session().await;
+        if let Ok(bytes) = serde_json::to_vec(&saved) {
+            let _ = store_session(session_path, &bytes);
+        }
+    }
+    Ok(match step {
+        icloud_proto::AuthStep::SignedIn => "signed_in".into(),
+        icloud_proto::AuthStep::NeedsCode => "needs_code".into(),
+        icloud_proto::AuthStep::NeedsTerms => "needs_terms".into(),
+        icloud_proto::AuthStep::NeedsDeviceApproval => "needs_device".into(),
+        icloud_proto::AuthStep::Failed(message) => format!("failed:{message}"),
+    })
 }
 
 async fn proxy() -> Result<ServiceProxy<'static>, String> {
@@ -396,28 +498,6 @@ async fn client_pin(paths: &[String], pinned: bool, notify: bool) -> Result<(), 
     }
 }
 
-fn install_menus() -> Result<(), String> {
-    let paths = load_paths()?;
-    apply_file_browser(&paths.config, true)
-}
-
-fn apply_file_browser(config: &std::path::Path, enabled: bool) -> Result<(), String> {
-    persist_setting(config, "file_browser", enabled).map_err(|err| err.to_string())?;
-    if enabled {
-        menus::install(&menus::binary_path()?)
-    } else {
-        menus::uninstall()
-    }
-}
-
-fn file_browser_enabled(config: &std::path::Path) -> bool {
-    std::fs::read_to_string(config)
-        .ok()
-        .and_then(|text| toml::from_str::<FileConfig>(&text).ok())
-        .and_then(|cfg| cfg.file_browser)
-        .unwrap_or(true)
-}
-
 fn desktop_notify(body: &str) {
     let _ = std::process::Command::new("notify-send")
         .args(["-a", "iCloud Drive", "iCloud Drive", body])
@@ -478,7 +558,6 @@ fn load_paths() -> Result<Paths, String> {
         config: config_path,
         mount,
         allow_deletion: file_config.allow_deletion.unwrap_or(false),
-        file_browser: file_config.file_browser.unwrap_or(true),
         poll_seconds: file_config.poll_seconds.unwrap_or(300),
         china: file_config.china.unwrap_or(false),
     })

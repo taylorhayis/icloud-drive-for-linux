@@ -175,9 +175,10 @@ impl IcloudClient {
     }
 
     pub async fn sign_in(&self, apple_id: &str, password: &str) -> Result<AuthStep> {
+        let apple_id = apple_id.trim().to_lowercase();
         {
             let mut auth = self.auth.lock().expect("auth");
-            auth.apple_id = Some(apple_id.to_string());
+            auth.apple_id = Some(apple_id.clone());
             auth.signed_in = false;
         }
         self.detect_partition().await;
@@ -189,7 +190,11 @@ impl IcloudClient {
         });
         let (status, _, body) = self.auth_post("/signin/init", init).await?;
         if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-            return Ok(AuthStep::Failed("Apple ID or password was not accepted".into()));
+            tracing::warn!(status = status.as_u16(), "sign-in init was rejected");
+            return Ok(AuthStep::Failed(format!(
+                "Apple did not start sign-in. Check the Apple ID. {}",
+                self.failure_text(status, &body)
+            )));
         }
         if !status.is_success() {
             return Ok(AuthStep::Failed(format!(
@@ -206,7 +211,7 @@ impl IcloudClient {
             .decode(init.b)
             .map_err(|err| ProtoError::Message(format!("server key: {err}")))?;
         let derived = derive_password(password, &salt, init.iteration, &init.protocol);
-        let proof = finish_srp(apple_id, &derived, &secrets.a_priv, &salt, &b_pub)?;
+        let proof = finish_srp(&apple_id, &derived, &secrets.a_priv, &salt, &b_pub)?;
         let complete = json!({
             "accountName": apple_id,
             "c": init.c,
@@ -219,7 +224,18 @@ impl IcloudClient {
             .auth_post("/signin/complete?isRememberMeEnabled=true", complete)
             .await?;
         if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-            return Ok(AuthStep::Failed("Apple ID or password was not accepted".into()));
+            tracing::warn!(
+                status = status.as_u16(),
+                protocol = %init.protocol,
+                "sign-in proof was rejected"
+            );
+            let detail = self.failure_text(status, &body);
+            let message = if detail.starts_with("iCloud returned") {
+                "Apple did not accept that password. Use the Apple ID password. An app-specific password will not work here.".into()
+            } else {
+                format!("Apple did not accept that password. {detail}")
+            };
+            return Ok(AuthStep::Failed(message));
         }
         if status == StatusCode::CONFLICT {
             self.note_auth_body(&body);

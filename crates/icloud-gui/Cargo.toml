@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 adw = { package = "libadwaita", version = "0.7", features = ["v1_5"] }
 gtk = { package = "gtk4", version = "0.9", features = ["v4_14"] }
+futures-util = "0.3"
 icloud-ipc = { path = "../icloud-ipc" }
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 zbus = "4.4"

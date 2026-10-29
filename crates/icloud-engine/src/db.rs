@@ -90,6 +90,8 @@ pub struct Node {
     pub etag: String,
     pub revision: i64,
     pub last_synced_ms: i64,
+    /// True after a download or a local write, so a zero-byte listing is not treated as the file.
+    pub bytes_fetched: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +99,14 @@ pub struct Attention {
     pub id: i64,
     pub kind: AttentionKind,
     pub ino: Option<i64>,
+    pub path: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActivityRecord {
+    pub at_ms: i64,
+    pub kind: String,
     pub path: String,
     pub detail: String,
 }
@@ -157,9 +167,24 @@ impl Db {
                 drivewsid TEXT PRIMARY KEY,
                 etag TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS sync_folders (
+                path TEXT PRIMARY KEY
+            );
+            CREATE TABLE IF NOT EXISTS activity (
+                id INTEGER PRIMARY KEY,
+                at_ms INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                path TEXT NOT NULL,
+                detail TEXT NOT NULL
+            );
             ",
         )?;
         self.ensure_column("remote_parent", "remote_parent TEXT")?;
+        self.ensure_column("bytes_fetched", "bytes_fetched INTEGER NOT NULL DEFAULT 0")?;
+        self.conn.execute(
+            "UPDATE items SET bytes_fetched = 1 WHERE complete = 1 AND size > 0 AND bytes_fetched = 0",
+            [],
+        )?;
         let count: i64 = self.conn.query_row("SELECT COUNT(*) FROM items WHERE ino = 1", [], |row| row.get(0))?;
         if count == 0 {
             self.conn.execute(
@@ -314,7 +339,7 @@ impl Db {
         Ok(count.max(0) as u64)
     }
 
-    fn upsert_remote(&mut self, parent: i64, parent_drivewsid: &str, child: &RemoteNode) -> Result<bool> {
+    pub(crate) fn upsert_remote(&mut self, parent: i64, parent_drivewsid: &str, child: &RemoteNode) -> Result<bool> {
         let kind = match child.kind {
             RemoteKind::File => NodeKind::File,
             RemoteKind::Folder => NodeKind::Directory,
@@ -340,9 +365,18 @@ impl Db {
                 )?;
                 return Ok(true);
             }
+            let still_complete = if !existing.dirty && existing.complete && existing.bytes_fetched && existing.size == child.size {
+                1
+            } else if existing.dirty {
+                existing.complete as i64
+            } else if child.size > 0 && existing.size == 0 && !existing.bytes_fetched {
+                0
+            } else {
+                existing.complete as i64
+            };
             self.conn.execute(
-                "UPDATE items SET parent_ino = ?1, name_apple = ?2, name_local = ?3, node_type = ?4, size = ?5, etag = ?6, mtime_ms = ?7, docwsid = ?8, revision = revision + 1, last_synced_ms = ?9 WHERE ino = ?10",
-                params![parent, child.name_apple, child.name_local, kind.as_str(), child.size as i64, child.etag, child.mtime_ms, child.docwsid, now_ms(), existing.ino],
+                "UPDATE items SET parent_ino = ?1, name_apple = ?2, name_local = ?3, node_type = ?4, size = ?5, etag = ?6, mtime_ms = ?7, docwsid = ?8, complete = ?9, revision = revision + 1, last_synced_ms = ?10 WHERE ino = ?11",
+                params![parent, child.name_apple, child.name_local, kind.as_str(), child.size as i64, child.etag, child.mtime_ms, child.docwsid, still_complete, now_ms(), existing.ino],
             )?;
             self.reindex(existing.ino, &child.name_local)?;
             return Ok(true);
@@ -383,7 +417,7 @@ impl Db {
 
     pub fn mark_complete(&mut self, ino: i64, blob: &Path, size: u64) -> Result<()> {
         self.conn.execute(
-            "UPDATE items SET complete = 1, blob_path = ?1, size = ?2, mtime_ms = ?3 WHERE ino = ?4",
+            "UPDATE items SET complete = 1, bytes_fetched = 1, blob_path = ?1, size = ?2, mtime_ms = ?3 WHERE ino = ?4",
             params![blob.to_string_lossy().to_string(), size as i64, now_ms(), ino],
         )?;
         Ok(())
@@ -403,11 +437,113 @@ impl Db {
     }
 
     pub fn set_pin_tree(&mut self, ino: i64, pin: bool) -> Result<()> {
-        self.conn.execute("UPDATE items SET pin = ?1 WHERE ino = ?2", params![pin as i64, ino])?;
-        for child in self.children(ino)? {
-            self.set_pin_tree(child.ino, pin)?;
-        }
+        self.conn.execute(
+            "WITH RECURSIVE tree(ino) AS (
+                SELECT ?1
+                UNION ALL
+                SELECT items.ino FROM items JOIN tree ON items.parent_ino = tree.ino
+            )
+            UPDATE items SET pin = ?2 WHERE ino IN (SELECT ino FROM tree)",
+            params![ino, pin as i64],
+        )?;
         Ok(())
+    }
+
+    pub fn set_pinned_flag(&mut self, ino: i64, pin: bool) -> Result<()> {
+        self.conn.execute("UPDATE items SET pin = ?1 WHERE ino = ?2", params![pin as i64, ino])?;
+        Ok(())
+    }
+
+    pub fn sync_folders(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT path FROM sync_folders ORDER BY path")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn add_sync_folder(&mut self, path: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO sync_folders (path) VALUES (?1) ON CONFLICT(path) DO NOTHING",
+            params![path],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_sync_folder(&mut self, path: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM sync_folders WHERE path = ?1", params![path])?;
+        Ok(())
+    }
+
+    /// Newest events stay. Older ones are dropped so the log does not grow without a limit.
+    pub fn record_activity(&self, kind: &str, path: &str, detail: &str) -> Result<()> {
+        let detail: String = detail.chars().take(180).collect();
+        self.conn.execute(
+            "INSERT INTO activity (at_ms, kind, path, detail) VALUES (?1, ?2, ?3, ?4)",
+            params![now_ms(), kind, path, detail],
+        )?;
+        self.conn.execute(
+            "DELETE FROM activity WHERE id < (SELECT id FROM activity ORDER BY id DESC LIMIT 1 OFFSET 199)",
+            [],
+        )?;
+        Ok(())
+    }
+
+    pub fn recent_activity(&self, limit: u32) -> Result<Vec<ActivityRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT at_ms, kind, path, detail FROM activity ORDER BY id DESC LIMIT ?1")?;
+        let rows = stmt.query_map(params![limit], |row| {
+            Ok(ActivityRecord {
+                at_ms: row.get(0)?,
+                kind: row.get(1)?,
+                path: row.get(2)?,
+                detail: row.get(3)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn next_incomplete_pin(&self, skip: &[i64]) -> Result<Option<Node>> {
+        if skip.is_empty() {
+            return self.query_one(
+                "SELECT * FROM items WHERE pin = 1 AND complete = 0 AND node_type = 'file' ORDER BY parent_ino, name_local LIMIT 1",
+                [],
+            );
+        }
+        let marks = std::iter::repeat_n("?", skip.len()).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT * FROM items WHERE pin = 1 AND complete = 0 AND node_type = 'file' AND ino NOT IN ({marks}) ORDER BY parent_ino, name_local LIMIT 1"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(skip.iter()))?;
+        rows.next()?.map(map_node).transpose().map_err(Into::into)
+    }
+
+    /// Local copies under `root` that are no longer pinned and have no local edits.
+    pub fn unpinned_local_files(&self, root: i64) -> Result<Vec<Node>> {
+        let mut stmt = self.conn.prepare(
+            "WITH RECURSIVE tree(ino) AS (
+                SELECT ?1
+                UNION ALL
+                SELECT items.ino FROM items JOIN tree ON items.parent_ino = tree.ino
+            )
+            SELECT * FROM items
+            WHERE ino IN (SELECT ino FROM tree)
+              AND node_type = 'file' AND pin = 0 AND dirty = 0 AND blob_path IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(params![root], map_node)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Pinned files that were marked complete from an empty listing, before any bytes were saved.
+    pub fn empty_stubs(&self) -> Result<Vec<Node>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM items
+             WHERE node_type = 'file' AND complete = 1 AND dirty = 0 AND pin = 1
+               AND size = 0 AND bytes_fetched = 0
+               AND docwsid IS NOT NULL AND docwsid != ''",
+        )?;
+        let rows = stmt.query_map([], map_node)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn incomplete_pins(&self) -> Result<Vec<Node>> {
@@ -497,7 +633,7 @@ impl Db {
 
     pub fn forget_local_bytes(&mut self, ino: i64) -> Result<()> {
         self.conn.execute(
-            "UPDATE items SET complete = 0, dirty = 0, blob_path = NULL WHERE ino = ?1",
+            "UPDATE items SET complete = 0, dirty = 0, bytes_fetched = 0, blob_path = NULL WHERE ino = ?1",
             params![ino],
         )?;
         Ok(())
@@ -592,6 +728,9 @@ impl Db {
             "INSERT INTO attention (kind, ino, path, detail, dismissed) VALUES (?1, ?2, ?3, ?4, 0)",
             params![kind.as_str(), ino, path, detail],
         )?;
+        if kind == AttentionKind::Conflict {
+            let _ = self.record_activity("conflict", path, detail);
+        }
         Ok(())
     }
 
@@ -687,6 +826,7 @@ fn map_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
         etag: row.get("etag")?,
         revision: row.get("revision")?,
         last_synced_ms: row.get("last_synced_ms")?,
+        bytes_fetched: row.get::<_, i64>("bytes_fetched")? != 0,
     })
 }
 
@@ -814,5 +954,58 @@ mod tests {
         let hits = db.search("Obsidian").unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].kind, NodeKind::Directory);
+    }
+
+    #[test]
+    fn pinning_a_folder_pins_its_children_only() {
+        let mut db = Db::open_memory().unwrap();
+        let folder = db.create(ROOT_INO, "Photos", NodeKind::Directory).unwrap();
+        let photo = db.create(folder, "a.jpg", NodeKind::File).unwrap();
+        let other = db.create(ROOT_INO, "note.txt", NodeKind::File).unwrap();
+        db.set_pin_tree(folder, true).unwrap();
+        assert!(db.node(photo).unwrap().pin);
+        assert!(db.node(folder).unwrap().pin);
+        assert!(!db.node(other).unwrap().pin);
+        db.set_pin_tree(folder, false).unwrap();
+        assert!(!db.node(photo).unwrap().pin);
+    }
+
+    #[test]
+    fn sync_folders_round_trip() {
+        let mut db = Db::open_memory().unwrap();
+        db.add_sync_folder("/Photos").unwrap();
+        db.add_sync_folder("/").unwrap();
+        db.add_sync_folder("/Photos").unwrap();
+        assert_eq!(db.sync_folders().unwrap(), vec!["/".to_string(), "/Photos".to_string()]);
+        db.remove_sync_folder("/").unwrap();
+        assert_eq!(db.sync_folders().unwrap(), vec!["/Photos".to_string()]);
+    }
+
+    #[test]
+    fn a_finished_download_is_not_an_empty_stub() {
+        let mut db = Db::open_memory().unwrap();
+        db.apply_snapshot(ROOT_INO, 1, true, &[file("a", "empty.txt", 0, "e")]).unwrap();
+        let node = db.child(ROOT_INO, "empty.txt").unwrap().unwrap();
+        db.set_pinned_flag(node.ino, true).unwrap();
+        db.conn
+            .execute("UPDATE items SET complete = 1 WHERE ino = ?1", params![node.ino])
+            .unwrap();
+        assert_eq!(db.empty_stubs().unwrap().len(), 1);
+        db.mark_complete(node.ino, Path::new("/tmp/empty.txt"), 0).unwrap();
+        assert!(db.empty_stubs().unwrap().is_empty());
+        assert!(db.node(node.ino).unwrap().bytes_fetched);
+    }
+
+    #[test]
+    fn activity_is_newest_first_and_capped() {
+        let db = Db::open_memory().unwrap();
+        for n in 0..205 {
+            db.record_activity("downloaded", &format!("/f{n}.txt"), "1 KB").unwrap();
+        }
+        let recent = db.recent_activity(200).unwrap();
+        assert_eq!(recent.len(), 200);
+        assert_eq!(recent[0].path, "/f204.txt");
+        assert_eq!(recent[0].kind, "downloaded");
+        assert!(!recent.iter().any(|row| row.path == "/f0.txt"));
     }
 }

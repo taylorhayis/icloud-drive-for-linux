@@ -620,22 +620,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fuser"
-version = "0.15.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53274f494609e77794b627b1a3cddfe45d675a6b2e9ba9c0fdc8d8eee2184369"
-dependencies = [
- "libc",
- "log",
- "memchr",
- "nix",
- "page_size",
- "pkg-config",
- "smallvec",
- "zerocopy",
-]
-
-[[package]]
 name = "futures-channel"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1183,12 +1167,9 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "dirs",
- "fuser",
  "icloud-engine",
  "icloud-ipc",
- "icloud-mount",
  "icloud-proto",
- "libc",
  "serde",
  "serde_json",
  "tokio",
@@ -1215,6 +1196,7 @@ dependencies = [
 name = "icloud-gui"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "gtk4",
  "icloud-ipc",
  "libadwaita",
@@ -1231,23 +1213,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "icloud-mount"
-version = "0.1.0"
-dependencies = [
- "fuser",
- "icloud-engine",
- "libc",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "icloud-proto"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
  "futures-util",
+ "num-bigint",
  "pbkdf2",
  "rand 0.8.8",
  "reqwest",
@@ -1627,16 +1599,6 @@ checksum = "9aa2b01e1d916879f73a53d01d1d6cee68adbb31d6d9177a8cfce093cced1d50"
 dependencies = [
  "futures-core",
  "pin-project-lite",
-]
-
-[[package]]
-name = "page_size"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30d5b2194ed13191c1999ae0704b7839fb18384fa22e49b57eeaa97d79ce40da"
-dependencies = [
- "libc",
- "winapi",
 ]
 
 [[package]]
@@ -2898,28 +2860,6 @@ dependencies = [
  "js-sys",
  "wasm-bindgen",
 ]
-
-[[package]]
-name = "winapi"
-version = "0.3.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c839a674fcd7a98952e593242ea400abe93992746761e38641405d28b00f419"
-dependencies = [
- "winapi-i686-pc-windows-gnu",
- "winapi-x86_64-pc-windows-gnu",
-]
-
-[[package]]
-name = "winapi-i686-pc-windows-gnu"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac3b87c63620426dd9b991e5ce0329eff545bccbbb34f3be09ff6fb6ab51b7b6"
-
-[[package]]
-name = "winapi-x86_64-pc-windows-gnu"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
 name = "windows-core"

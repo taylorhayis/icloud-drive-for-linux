@@ -1,6 +1,8 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
+
+use futures_util::StreamExt;
 
 use adw::prelude::*;
 use gtk::glib::{self, ControlFlow};
@@ -14,10 +16,26 @@ struct Widgets {
     search_results: gtk::ListBox,
     apple_id: gtk::Entry,
     password: gtk::PasswordEntry,
+    sign_in: gtk::Button,
     code: gtk::Entry,
+    submit_code: gtk::Button,
+    sms: gtk::Button,
+    terms: gtk::Button,
+    approve: gtk::Button,
     auth_status: gtk::Label,
+    auth: gtk::Box,
+    /// True after this window finished a sign-in, until the service leaves `needs_auth`.
+    hold_login: Cell<bool>,
     allow_deletion: gtk::Switch,
-    file_browser: gtk::Switch,
+    start: gtk::Button,
+    quit: gtk::Button,
+    folder_path: gtk::Label,
+    folder_list: gtk::ListBox,
+    sync_roots: gtk::ListBox,
+    sync_all: gtk::Button,
+    folders_signature: RefCell<String>,
+    activity: gtk::ListBox,
+    activity_signature: RefCell<String>,
 }
 
 fn main() -> glib::ExitCode {
@@ -37,6 +55,18 @@ fn build(app: &adw::Application) {
         .build();
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let header = adw::HeaderBar::new();
+    let start = gtk::Button::with_label("Start");
+    start.add_css_class("suggested-action");
+    let quit = gtk::Button::with_label("Quit");
+    quit.set_visible(false);
+    header.pack_start(&start);
+    header.pack_end(&quit);
+    let stack = adw::ViewStack::new();
+    let switcher = adw::ViewSwitcher::builder()
+        .stack(&stack)
+        .policy(adw::ViewSwitcherPolicy::Wide)
+        .build();
+    header.set_title_widget(Some(&switcher));
     root.append(&header);
 
     let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
@@ -60,24 +90,31 @@ fn build(app: &adw::Application) {
     let apple_id = gtk::Entry::builder().placeholder_text("Apple ID").build();
     let password = gtk::PasswordEntry::builder().placeholder_text("Password").build();
     let code = gtk::Entry::builder().placeholder_text("Verification code").build();
-    let auth_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    code.set_visible(false);
     let sign_in = gtk::Button::with_label("Sign in");
+    sign_in.add_css_class("suggested-action");
     let submit_code = gtk::Button::with_label("Submit code");
+    submit_code.set_visible(false);
+    submit_code.add_css_class("suggested-action");
     let sms = gtk::Button::with_label("Text me a code");
+    sms.set_visible(false);
     let terms = gtk::Button::with_label("Accept terms");
-    let approve = gtk::Button::with_label("Approve on iPhone");
-    auth_buttons.append(&sign_in);
-    auth_buttons.append(&submit_code);
-    auth_buttons.append(&sms);
-    auth_buttons.append(&terms);
-    auth_buttons.append(&approve);
-    let auth_status = gtk::Label::new(Some("The password is not saved. A trusted session is."));
+    terms.set_visible(false);
+    let approve = gtk::Button::with_label("I've approved it");
+    approve.set_visible(false);
+    let auth_status = gtk::Label::new(Some("The password is not saved."));
     auth_status.set_xalign(0.0);
+    auth_status.set_wrap(true);
     auth.append(&apple_id);
     auth.append(&password);
+    auth.append(&sign_in);
     auth.append(&code);
-    auth.append(&auth_buttons);
+    auth.append(&submit_code);
+    auth.append(&sms);
+    auth.append(&terms);
+    auth.append(&approve);
     auth.append(&auth_status);
+    auth.set_visible(false);
     content.append(&auth);
 
     content.append(&section_label("Needs attention"));
@@ -92,6 +129,30 @@ fn build(app: &adw::Application) {
     content.append(&search);
     content.append(&search_results);
 
+    content.append(&section_label("Folders to sync"));
+    let folder_note = gtk::Label::new(Some(
+        "Chosen folders are saved into ~/iCloud Drive with their real contents. A file shows up only after it has fully downloaded, so a photo viewer does not open an empty file. Edits in that folder upload back. You can choose the whole drive.",
+    ));
+    folder_note.set_xalign(0.0);
+    folder_note.set_wrap(true);
+    content.append(&folder_note);
+    let sync_roots = gtk::ListBox::new();
+    sync_roots.add_css_class("boxed-list");
+    content.append(&sync_roots);
+    let sync_all = gtk::Button::with_label("Sync entire iCloud Drive");
+    content.append(&sync_all);
+    let folder_nav = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let folder_back = gtk::Button::with_label("Back");
+    let folder_path = gtk::Label::new(Some("/"));
+    folder_path.set_xalign(0.0);
+    folder_path.set_hexpand(true);
+    folder_nav.append(&folder_back);
+    folder_nav.append(&folder_path);
+    content.append(&folder_nav);
+    let folder_list = gtk::ListBox::new();
+    folder_list.add_css_class("boxed-list");
+    content.append(&folder_list);
+
     let deletion_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     let deletion_label = gtk::Label::new(Some("Allow deletion"));
     deletion_label.set_hexpand(true);
@@ -101,26 +162,11 @@ fn build(app: &adw::Application) {
     deletion_row.append(&allow_deletion);
     content.append(&deletion_row);
     let deletion_note = gtk::Label::new(Some(
-        "Off by default. Saving a file still works. Turning this on can remove files from iCloud Drive.",
+        "Off by default. Pinned files stay in the iCloud Drive folder after you quit. Turning this on can remove them from iCloud.",
     ));
     deletion_note.set_xalign(0.0);
     deletion_note.set_wrap(true);
     content.append(&deletion_note);
-
-    let browser_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    let browser_label = gtk::Label::new(Some("File manager menu"));
-    browser_label.set_hexpand(true);
-    browser_label.set_xalign(0.0);
-    let file_browser = gtk::Switch::new();
-    browser_row.append(&browser_label);
-    browser_row.append(&file_browser);
-    content.append(&browser_row);
-    let browser_note = gtk::Label::new(Some(
-        "Adds iC - Pin Download and iC - Unpin Download in COSMIC Files and GNOME Files, and an iCloud Drive menu in Dolphin. Reopen the file manager after changing this.",
-    ));
-    browser_note.set_xalign(0.0);
-    browser_note.set_wrap(true);
-    content.append(&browser_note);
 
     let open_folder = gtk::Button::with_label("Open iCloud Drive");
     content.append(&open_folder);
@@ -128,7 +174,27 @@ fn build(app: &adw::Application) {
     let scroll = gtk::ScrolledWindow::new();
     scroll.set_vexpand(true);
     scroll.set_child(Some(&content));
-    root.append(&scroll);
+    stack.add_titled(&scroll, Some("sync"), "Sync");
+
+    let activity_page = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    activity_page.set_margin_top(16);
+    activity_page.set_margin_bottom(16);
+    activity_page.set_margin_start(16);
+    activity_page.set_margin_end(16);
+    let activity_note = gtk::Label::new(Some(
+        "Downloads from iCloud, uploads from this computer, and other sync events. Newest first.",
+    ));
+    activity_note.set_xalign(0.0);
+    activity_note.set_wrap(true);
+    activity_page.append(&activity_note);
+    let activity = gtk::ListBox::new();
+    activity.add_css_class("boxed-list");
+    activity_page.append(&activity);
+    let activity_scroll = gtk::ScrolledWindow::new();
+    activity_scroll.set_vexpand(true);
+    activity_scroll.set_child(Some(&activity_page));
+    stack.add_titled(&activity_scroll, Some("activity"), "Activity");
+    root.append(&stack);
     window.set_content(Some(&root));
 
     let widgets = Rc::new(Widgets {
@@ -139,25 +205,59 @@ fn build(app: &adw::Application) {
         search_results,
         apple_id,
         password,
+        sign_in: sign_in.clone(),
         code,
+        submit_code: submit_code.clone(),
+        sms: sms.clone(),
+        terms: terms.clone(),
+        approve: approve.clone(),
         auth_status,
+        auth,
+        hold_login: Cell::new(false),
         allow_deletion,
-        file_browser,
+        start: start.clone(),
+        quit: quit.clone(),
+        folder_path,
+        folder_list,
+        sync_roots,
+        sync_all: sync_all.clone(),
+        folders_signature: RefCell::new(String::new()),
+        activity,
+        activity_signature: RefCell::new(String::new()),
     });
+
+    let browser = std::sync::Arc::new(std::sync::Mutex::new("/".to_string()));
 
     let (tx, rx) = std::sync::mpsc::channel::<UiMsg>();
 
     let sign_widgets = Rc::clone(&widgets);
     let sign_tx = tx.clone();
     sign_in.connect_clicked(move |_| {
+        sign_widgets.auth_status.set_text("Signing in…");
+        sign_widgets.sign_in.set_sensitive(false);
         call_auth(sign_tx.clone(), &sign_widgets, "begin");
+    });
+    let password_sign = sign_in.clone();
+    widgets.password.connect_activate(move |_| {
+        password_sign.emit_clicked();
     });
     let code_widgets = Rc::clone(&widgets);
     let code_tx = tx.clone();
-    submit_code.connect_clicked(move |_| call_auth(code_tx.clone(), &code_widgets, "code"));
+    submit_code.connect_clicked(move |_| {
+        code_widgets.auth_status.set_text("Checking the code…");
+        code_widgets.submit_code.set_sensitive(false);
+        call_auth(code_tx.clone(), &code_widgets, "code");
+    });
+    let code_submit = submit_code.clone();
+    widgets.code.connect_activate(move |_| {
+        code_submit.emit_clicked();
+    });
     let sms_widgets = Rc::clone(&widgets);
     let sms_tx = tx.clone();
-    sms.connect_clicked(move |_| call_auth(sms_tx.clone(), &sms_widgets, "sms"));
+    sms.connect_clicked(move |_| {
+        sms_widgets.auth_status.set_text("Sending a text…");
+        call_auth(sms_tx.clone(), &sms_widgets, "sms");
+    });
     let terms_widgets = Rc::clone(&widgets);
     let terms_tx = tx.clone();
     terms.connect_clicked(move |_| call_auth(terms_tx.clone(), &terms_widgets, "terms"));
@@ -208,17 +308,38 @@ fn build(app: &adw::Application) {
         false.into()
     });
 
-    let browser_widgets = Rc::clone(&widgets);
-    widgets.file_browser.clone().connect_state_set(move |_, state| {
-        let enabled = state;
-        let _ = std::thread::spawn(move || {
-            let _ = block_on(async move {
+    quit.connect_clicked(|_| {
+        std::thread::spawn(|| {
+            let _ = block_on(async {
                 let connection = zbus::Connection::session().await.ok()?;
                 let proxy = ServiceProxy::new(&connection).await.ok()?;
-                proxy.set_file_browser(enabled).await.ok()
+                proxy.quit().await.ok()
             });
         });
-        false.into()
+    });
+    start.connect_clicked(|_| {
+        std::thread::spawn(start_daemon);
+    });
+
+    let back_browser = std::sync::Arc::clone(&browser);
+    folder_back.connect_clicked(move |_| {
+        let mut path = back_browser.lock().expect("browser");
+        if *path == "/" {
+            return;
+        }
+        match path.rfind('/') {
+            Some(0) | None => *path = "/".into(),
+            Some(index) => path.truncate(index),
+        }
+    });
+    sync_all.connect_clicked(|_| {
+        confirm(
+            "Sync entire iCloud Drive?",
+            "This downloads every file into ~/iCloud Drive. A large library can fill this disk. You can stop it later.",
+            "Sync entire drive",
+            false,
+            || set_sync_folder("/", true),
+        );
     });
 
     open_folder.connect_clicked(|_| {
@@ -228,54 +349,67 @@ fn build(app: &adw::Application) {
                 let proxy = ServiceProxy::new(&connection).await.ok()?;
                 proxy.mount_point().await.ok()
             });
-            if let Some(mount) = mount {
-                let _ = std::process::Command::new("xdg-open").arg(mount).spawn();
-            }
+            let mount = mount.unwrap_or_else(|| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+                format!("{home}/iCloud Drive")
+            });
+            let _ = std::process::Command::new("xdg-open").arg(mount).spawn();
         });
     });
 
     let poll_tx = tx.clone();
-    std::thread::spawn(move || loop {
-        let update = block_on(poll());
-        if poll_tx.send(UiMsg::Poll(update)).is_err() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(700));
+    let poll_browser = std::sync::Arc::clone(&browser);
+    std::thread::spawn(move || {
+        block_on(watch_service(poll_tx, poll_browser));
     });
     let tick_widgets = Rc::clone(&widgets);
+    let browser_ui = std::sync::Arc::clone(&browser);
     let rx = Rc::new(RefCell::new(rx));
     glib::timeout_add_local(Duration::from_millis(300), move || {
         let mut poll = None;
         let mut searches = Vec::new();
         let mut auths = Vec::new();
+        let mut folders = None;
+        let mut activity = None;
         while let Ok(msg) = rx.borrow_mut().try_recv() {
             match msg {
                 UiMsg::Poll(update) => poll = Some(update),
                 UiMsg::Search(hits) => searches.push(hits),
                 UiMsg::Auth(message) => auths.push(message),
+                UiMsg::Folders(update) => folders = Some(update),
+                UiMsg::Activity(events) => activity = Some(events),
             }
         }
         if let Some(update) = poll {
             match update {
-                Some((status, attention, allow, menus)) => {
-                    apply_status(&tick_widgets, &status, &attention, allow, menus)
+                Some((status, attention, allow)) => {
+                    tick_widgets.start.set_visible(false);
+                    tick_widgets.quit.set_visible(true);
+                    apply_status(&tick_widgets, &status, &attention, allow)
                 }
                 None => {
-                    tick_widgets.status.set_text("Sync service is not running");
-                    tick_widgets.detail.set_text("Start it with icloud-drive daemon");
+                    tick_widgets.start.set_visible(true);
+                    tick_widgets.quit.set_visible(false);
+                    tick_widgets.status.set_text("Sync service is stopped");
+                    tick_widgets.detail.set_text("Press Start to run it again. ~/iCloud Drive stays where it is.");
+                    tick_widgets.hold_login.set(false);
+                    tick_widgets.auth.set_visible(false);
+                    tick_widgets.progress.set_fraction(0.0);
+                    tick_widgets.progress.set_text(Some(""));
                 }
             }
+        }
+        if let Some((path, choices, roots)) = folders {
+            fill_folders(&tick_widgets, &browser_ui, &path, &choices, &roots);
+        }
+        if let Some(events) = activity {
+            fill_activity(&tick_widgets, &events);
         }
         for hits in searches {
             fill_search(&tick_widgets, &hits);
         }
         for message in auths {
-            if message == "signed_in" {
-                tick_widgets.password.set_text("");
-                tick_widgets.auth_status.set_text("Signed in");
-            } else {
-                tick_widgets.auth_status.set_text(&message);
-            }
+            apply_auth(&tick_widgets, &message);
         }
         ControlFlow::Continue
     });
@@ -295,8 +429,10 @@ fn apply_status(
     status: &StatusSnapshot,
     attention: &[AttentionSnapshot],
     allow: bool,
-    file_browser: bool,
 ) {
+    let hold = hold_after_sign_in(widgets.hold_login.get(), &status.phase, false);
+    widgets.hold_login.set(hold);
+    widgets.auth.set_visible(login_visible(&status.phase, hold));
     widgets.status.set_text(&status.label);
     let mut detail = status.phase.clone();
     if !status.current_path.is_empty() {
@@ -329,9 +465,6 @@ fn apply_status(
     }
     if widgets.allow_deletion.state() != allow {
         widgets.allow_deletion.set_state(allow);
-    }
-    if widgets.file_browser.state() != file_browser {
-        widgets.file_browser.set_state(file_browser);
     }
     clear(&widgets.attention);
     for item in attention {
@@ -413,6 +546,73 @@ fn clear(list: &gtk::ListBox) {
     }
 }
 
+fn login_visible(phase: &str, hold_after_sign_in: bool) -> bool {
+    phase == "needs_auth" && !hold_after_sign_in
+}
+
+fn hold_after_sign_in(previous: bool, phase: &str, just_signed_in: bool) -> bool {
+    if just_signed_in {
+        return true;
+    }
+    previous && phase == "needs_auth"
+}
+
+fn apply_auth(widgets: &Widgets, message: &str) {
+    widgets.sign_in.set_sensitive(true);
+    widgets.submit_code.set_sensitive(true);
+    match message {
+        "signed_in" => {
+            widgets.password.set_text("");
+            widgets.code.set_text("");
+            set_auth_step(widgets, AuthStep::SignedIn);
+            widgets.auth_status.set_text("Signed in");
+            widgets.hold_login.set(true);
+            widgets.auth.set_visible(false);
+        }
+        "needs_code" => {
+            widgets.hold_login.set(false);
+            widgets.auth.set_visible(true);
+            set_auth_step(widgets, AuthStep::Code);
+            widgets.auth_status.set_text("Enter the verification code Apple sent.");
+            widgets.code.grab_focus();
+        }
+        "needs_terms" => {
+            widgets.hold_login.set(false);
+            widgets.auth.set_visible(true);
+            set_auth_step(widgets, AuthStep::Terms);
+            widgets.auth_status.set_text("Apple updated the terms. Accept them to continue.");
+        }
+        "needs_device" => {
+            widgets.hold_login.set(false);
+            widgets.auth.set_visible(true);
+            set_auth_step(widgets, AuthStep::Device);
+            widgets.auth_status.set_text("Approve this sign-in on a trusted device, then continue.");
+        }
+        other => {
+            widgets.hold_login.set(false);
+            widgets.auth.set_visible(true);
+            let text = other.strip_prefix("failed:").unwrap_or(other);
+            widgets.auth_status.set_text(text);
+        }
+    }
+}
+
+enum AuthStep {
+    SignedIn,
+    Code,
+    Terms,
+    Device,
+}
+
+fn set_auth_step(widgets: &Widgets, step: AuthStep) {
+    let code = matches!(step, AuthStep::Code);
+    widgets.code.set_visible(code);
+    widgets.submit_code.set_visible(code);
+    widgets.sms.set_visible(code);
+    widgets.terms.set_visible(matches!(step, AuthStep::Terms));
+    widgets.approve.set_visible(matches!(step, AuthStep::Device));
+}
+
 fn call_auth(tx: std::sync::mpsc::Sender<UiMsg>, widgets: &Rc<Widgets>, kind: &str) {
     let apple_id = widgets.apple_id.text().to_string();
     let password = widgets.password.text().to_string();
@@ -423,31 +623,47 @@ fn call_auth(tx: std::sync::mpsc::Sender<UiMsg>, widgets: &Rc<Widgets>, kind: &s
             let connection = zbus::Connection::session().await.ok()?;
             let proxy = ServiceProxy::new(&connection).await.ok()?;
             let step = match kind.as_str() {
-                "code" => proxy.submit_code(&code).await.ok()?,
-                "sms" => proxy.request_sms().await.ok()?,
-                "terms" => proxy.accept_terms().await.ok()?,
-                "approve" => proxy.request_device_approval().await.ok()?,
-                _ => proxy.begin_sign_in(&apple_id, &password).await.ok()?,
+                "code" => proxy.submit_code(&code).await,
+                "sms" => proxy.request_sms().await,
+                "terms" => proxy.accept_terms().await,
+                "approve" => proxy.request_device_approval().await,
+                _ => proxy.begin_sign_in(&apple_id, &password).await,
             };
-            Some(step)
+            Some(match step {
+                Ok(step) => step,
+                Err(err) => format!("failed:{err}"),
+            })
         });
-        let message = result.unwrap_or_else(|| "Could not reach the sync service".into());
+        let message = result.unwrap_or_else(|| "failed:Could not reach the sync service".into());
         let _ = tx.send(UiMsg::Auth(message));
     });
 }
 
 fn confirm_deletion(on_yes: impl Fn() + 'static) {
-    let dialog = adw::MessageDialog::new(
-        None::<&gtk::Window>,
-        Some("Allow deletion?"),
-        Some("This can remove files from iCloud Drive, including from your other devices."),
+    confirm(
+        "Allow deletion?",
+        "This can remove files from iCloud Drive, including from your other devices.",
+        "Allow deletion",
+        true,
+        on_yes,
     );
+}
+
+fn confirm(title: &str, body: &str, accept: &str, destructive: bool, on_yes: impl Fn() + 'static) {
+    let dialog = adw::MessageDialog::new(None::<&gtk::Window>, Some(title), Some(body));
     dialog.add_response("cancel", "Cancel");
-    dialog.add_response("allow", "Allow deletion");
-    dialog.set_response_appearance("allow", adw::ResponseAppearance::Destructive);
+    dialog.add_response("ok", accept);
+    dialog.set_response_appearance(
+        "ok",
+        if destructive {
+            adw::ResponseAppearance::Destructive
+        } else {
+            adw::ResponseAppearance::Suggested
+        },
+    );
     let on_yes = Rc::new(RefCell::new(Some(on_yes)));
     dialog.connect_response(None, move |dialog, response| {
-        if response == "allow" {
+        if response == "ok" {
             if let Some(action) = on_yes.borrow_mut().take() {
                 action();
             }
@@ -457,22 +673,329 @@ fn confirm_deletion(on_yes: impl Fn() + 'static) {
     dialog.present();
 }
 
-type PollUpdate = Option<(StatusSnapshot, Vec<AttentionSnapshot>, bool, bool)>;
+fn set_sync_folder(path: &str, enabled: bool) {
+    let path = path.to_string();
+    std::thread::spawn(move || {
+        let _ = block_on(async move {
+            let connection = zbus::Connection::session().await.ok()?;
+            let proxy = ServiceProxy::new(&connection).await.ok()?;
+            proxy.set_sync_folder(&path, enabled).await.ok()
+        });
+    });
+}
+
+fn start_daemon() {
+    let started = std::process::Command::new("systemctl")
+        .args(["--user", "start", "icloud-drive.service"])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if started {
+        return;
+    }
+    let binary = std::env::var("HOME")
+        .map(|home| std::path::PathBuf::from(home).join(".local/bin/icloud-drive"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("icloud-drive"));
+    let _ = std::process::Command::new(binary).arg("daemon").spawn();
+}
+
+fn fill_folders(
+    widgets: &Widgets,
+    browser: &std::sync::Arc<std::sync::Mutex<String>>,
+    path: &str,
+    folders: &[icloud_ipc::FolderChoice],
+    roots: &[String],
+) {
+    let signature = format!(
+        "{path}|{}|{}",
+        folders
+            .iter()
+            .map(|folder| format!("{}:{}{}", folder.path, folder.synced as u8, folder.included as u8))
+            .collect::<Vec<_>>()
+            .join(","),
+        roots.join(",")
+    );
+    if widgets.folders_signature.borrow().as_str() == signature {
+        return;
+    }
+    *widgets.folders_signature.borrow_mut() = signature;
+    widgets.folder_path.set_text(if path == "/" { "iCloud Drive" } else { path });
+    widgets.sync_all.set_visible(!roots.iter().any(|root| root == "/"));
+
+    clear(&widgets.sync_roots);
+    if roots.is_empty() {
+        widgets.sync_roots.append(&note_row("No folders selected yet."));
+    }
+    for root in roots {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        pad_row(&row);
+        let label = if root == "/" { "Entire iCloud Drive" } else { root.as_str() };
+        let text = gtk::Label::new(Some(label));
+        text.set_hexpand(true);
+        text.set_xalign(0.0);
+        row.append(&text);
+        let path = root.clone();
+        let stop = gtk::Button::with_label("Stop");
+        stop.connect_clicked(move |_| {
+            let path = path.clone();
+            let title = if path == "/" {
+                "Stop syncing all of iCloud Drive?".to_string()
+            } else {
+                format!("Stop syncing {path}?")
+            };
+            confirm(
+                &title,
+                "Files you have not edited are removed from the iCloud Drive folder on this computer. They stay on iCloud.",
+                "Stop syncing",
+                true,
+                move || set_sync_folder(&path, false),
+            );
+        });
+        row.append(&stop);
+        widgets.sync_roots.append(&row);
+    }
+
+    clear(&widgets.folder_list);
+    if path != "/" {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        pad_row(&row);
+        let text = gtk::Label::new(Some(path));
+        text.set_hexpand(true);
+        text.set_xalign(0.0);
+        row.append(&text);
+        if roots.iter().any(|root| root == path) {
+            row.append(&gtk::Label::new(Some("Syncing")));
+        } else if icloud_ancestor(path, roots) {
+            row.append(&gtk::Label::new(Some("Included")));
+        } else {
+            let here = path.to_string();
+            let button = gtk::Button::with_label("Sync this folder");
+            button.connect_clicked(move |_| set_sync_folder(&here, true));
+            row.append(&button);
+        }
+        widgets.folder_list.append(&row);
+    }
+    if folders.is_empty() {
+        let waiting = if path == "/" {
+            "Top-level folders show up after the first listing."
+        } else if roots.iter().any(|root| root == path) || icloud_ancestor(path, roots) {
+            "No subfolders."
+        } else {
+            "Sync this folder to list what is inside it."
+        };
+        widgets.folder_list.append(&note_row(waiting));
+    }
+    for folder in folders {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        pad_row(&row);
+        let open = gtk::Button::with_label(&folder.name);
+        open.set_hexpand(true);
+        let next = folder.path.clone();
+        let browser = std::sync::Arc::clone(browser);
+        open.connect_clicked(move |_| {
+            *browser.lock().expect("browser") = next.clone();
+        });
+        row.append(&open);
+        if folder.synced {
+            row.append(&gtk::Label::new(Some("Syncing")));
+        } else if folder.included {
+            row.append(&gtk::Label::new(Some("Included")));
+        } else {
+            let path = folder.path.clone();
+            let button = gtk::Button::with_label("Sync");
+            button.connect_clicked(move |_| set_sync_folder(&path, true));
+            row.append(&button);
+        }
+        widgets.folder_list.append(&row);
+    }
+}
+
+fn icloud_ancestor(path: &str, roots: &[String]) -> bool {
+    roots.iter().any(|root| root == "/" || (root != path && path.starts_with(&format!("{root}/"))))
+}
+
+fn fill_activity(widgets: &Widgets, events: &[icloud_ipc::ActivityEvent]) {
+    let signature = events
+        .iter()
+        .map(|event| format!("{}:{}:{}:{}", event.at_ms, event.kind, event.path, event.detail))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if widgets.activity_signature.borrow().as_str() == signature {
+        return;
+    }
+    *widgets.activity_signature.borrow_mut() = signature;
+    clear(&widgets.activity);
+    if events.is_empty() {
+        widgets.activity.append(&note_row("No sync activity yet."));
+        return;
+    }
+    for event in events {
+        let row = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        pad_row(&row);
+        let head = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let title = gtk::Label::new(Some(activity_title(&event.kind)));
+        title.set_xalign(0.0);
+        title.set_hexpand(true);
+        title.add_css_class("heading");
+        let when = gtk::Label::new(Some(&format_when(event.at_ms)));
+        when.add_css_class("dim-label");
+        head.append(&title);
+        head.append(&when);
+        row.append(&head);
+        let path = gtk::Label::new(Some(&event.path));
+        path.set_xalign(0.0);
+        path.set_wrap(true);
+        path.set_selectable(true);
+        row.append(&path);
+        if !event.detail.is_empty() {
+            let detail = gtk::Label::new(Some(&event.detail));
+            detail.set_xalign(0.0);
+            detail.set_wrap(true);
+            detail.add_css_class("dim-label");
+            row.append(&detail);
+        }
+        widgets.activity.append(&row);
+    }
+}
+
+fn activity_title(kind: &str) -> &'static str {
+    match kind {
+        "downloaded" => "Downloaded",
+        "uploaded" => "Uploaded",
+        "download_failed" => "Download failed",
+        "upload_failed" => "Upload failed",
+        "sync_on" => "Syncing folder",
+        "sync_off" => "Stopped syncing",
+        "conflict" => "Conflict",
+        "local" => "Changed here",
+        "renamed" => "Renamed",
+        "moved" => "Moved",
+        _ => "Activity",
+    }
+}
+
+fn format_when(ms: i64) -> String {
+    let Ok(when) = glib::DateTime::from_unix_local(ms / 1000) else {
+        return String::new();
+    };
+    let same_day = glib::DateTime::now_local().ok().is_some_and(|now| {
+        now.year() == when.year() && now.day_of_year() == when.day_of_year()
+    });
+    let fmt = if same_day { "%H:%M" } else { "%d %b %H:%M" };
+    when.format(fmt).map(|text| text.to_string()).unwrap_or_default()
+}
+
+fn note_row(text: &str) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    pad_row(&row);
+    let label = gtk::Label::new(Some(text));
+    label.set_xalign(0.0);
+    label.set_wrap(true);
+    label.set_hexpand(true);
+    row.append(&label);
+    row
+}
+
+fn pad_row(row: &gtk::Box) {
+    row.set_margin_top(8);
+    row.set_margin_bottom(8);
+    row.set_margin_start(12);
+    row.set_margin_end(12);
+}
+
+type PollUpdate = Option<(StatusSnapshot, Vec<AttentionSnapshot>, bool)>;
 
 enum UiMsg {
     Poll(PollUpdate),
     Search(Vec<icloud_ipc::SearchHit>),
     Auth(String),
+    Folders((String, Vec<icloud_ipc::FolderChoice>, Vec<String>)),
+    Activity(Vec<icloud_ipc::ActivityEvent>),
 }
 
-async fn poll() -> PollUpdate {
-    let connection = zbus::Connection::session().await.ok()?;
-    let proxy = ServiceProxy::new(&connection).await.ok()?;
+async fn watch_service(tx: std::sync::mpsc::Sender<UiMsg>, browser: std::sync::Arc<std::sync::Mutex<String>>) {
+    loop {
+        let Some(connection) = zbus::Connection::session().await.ok() else {
+            if tx.send(UiMsg::Poll(None)).is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            continue;
+        };
+        let Ok(proxy) = ServiceProxy::new(&connection).await else {
+            if tx.send(UiMsg::Poll(None)).is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            continue;
+        };
+        let Ok(mut closing) = proxy.receive_closing().await else {
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            continue;
+        };
+        loop {
+            let update = read_status(&proxy).await;
+            let connected = update.is_some();
+            if tx.send(UiMsg::Poll(update)).is_err() {
+                return;
+            }
+            if connected {
+                let path = browser.lock().expect("browser").clone();
+                let folders = proxy.child_folders(&path).await.unwrap_or_default();
+                let roots = proxy.sync_folders().await.unwrap_or_default();
+                if tx.send(UiMsg::Folders((path, folders, roots))).is_err() {
+                    return;
+                }
+                if let Ok(events) = proxy.activity().await {
+                    if tx.send(UiMsg::Activity(events)).is_err() {
+                        return;
+                    }
+                }
+            }
+            let closed = tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(700)) => false,
+                _ = closing.next() => true,
+            };
+            if closed {
+                let _ = tx.send(UiMsg::Poll(None));
+                break;
+            }
+            if !connected {
+                break;
+            }
+        }
+    }
+}
+
+async fn read_status(proxy: &ServiceProxy<'_>) -> PollUpdate {
     let status = proxy.status().await.ok()?;
     let attention = proxy.attention().await.ok()?;
     let allow = proxy.allow_deletion().await.unwrap_or(false);
-    let menus = proxy.file_browser().await.unwrap_or(true);
-    Some((status, attention, allow, menus))
+    Some((status, attention, allow))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{hold_after_sign_in, login_visible};
+
+    #[test]
+    fn login_stays_hidden_while_a_sync_is_running() {
+        for phase in ["idle", "indexing", "downloading", "uploading", "error"] {
+            assert!(!login_visible(phase, false), "{phase}");
+        }
+        assert!(login_visible("needs_auth", false));
+    }
+
+    #[test]
+    fn a_finished_sign_in_stays_hidden_until_the_session_fails_again() {
+        let hold = hold_after_sign_in(false, "needs_auth", true);
+        assert!(!login_visible("needs_auth", hold));
+        let hold = hold_after_sign_in(hold, "downloading", false);
+        assert!(!hold);
+        assert!(!login_visible("downloading", hold));
+        let hold = hold_after_sign_in(hold, "needs_auth", false);
+        assert!(login_visible("needs_auth", hold));
+    }
 }
 
 fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
