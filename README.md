@@ -1,6 +1,6 @@
 # iCloud Drive for Linux
 
-A Linux client for iCloud Drive. The whole drive shows up as a folder in your file manager. Files that still live in the cloud keep their real names and sizes. Opening one downloads it. Files you choose to keep downloaded stay on disk and keep syncing.
+A Linux client for iCloud Drive. The whole drive shows up as a folder in your file manager. A library of any size stays a list of names until you open a file or mark it to keep offline. Only those files occupy disk space.
 
 Sign-in happens in a small GTK window. A background service owns the mount, the filename index, and the transfers. The window and a panel icon show what that service is doing.
 
@@ -8,9 +8,9 @@ This uses the same web API as iCloud.com. Apple does not publish that API, and t
 
 ## What you can do
 
-- Browse the whole drive from Files, Dolphin, Nautilus, or any other program that reads a normal folder.
-- Leave most files in the cloud. The local index is enough to search them by name.
-- Pin a file or folder with **Keep downloaded** so it stays local and is uploaded again after you edit it.
+- Browse the whole drive from Files, Dolphin, Nautilus, or any other program that reads a normal folder. The names are local. The bytes stay in iCloud.
+- Search by filename without downloading the files.
+- Pin a file or folder so that one item stays on disk and is uploaded again after you edit it. In COSMIC Files and GNOME Files that action is **iC - Pin Download**. In Dolphin it is **Keep downloaded**, inside an **iCloud Drive** menu.
 - Sign in, enter a verification code, accept updated terms, or approve Advanced Data Protection from the window.
 - Watch a sync or a single-file transfer on a progress bar, on the panel icon, and in one notification that updates in place.
 - Resolve a conflict, retry a transfer that stopped, or dismiss a file Apple no longer has. Those actions wait for you.
@@ -19,13 +19,15 @@ The folder is `~/iCloud Drive` unless you set another path.
 
 ## How a file gets here
 
-The service lists every folder and stores the names. That first walk of a large drive takes a while. Later checks are local until something actually has to move.
+The service lists names one folder at a time. The root is first, so those files and folder names show up as soon as that listing returns. It then walks the other folders breadth-first: every folder you can already see is filled in before the sync descends further. Each finished folder is written immediately. The window's progress bar is files already indexed out of the file count Apple reports for the whole drive. The line under it shows the folder being listed. A large drive still takes a long time to finish, and only the listing is downloaded. Later checks compare those names. They do not fetch file contents.
 
-A cloud file is a placeholder with the size Apple reported. The bytes are downloaded when a program opens the file. The download runs where a stall can be cancelled, so a stuck transfer does not freeze the file manager. Zero-byte files are recorded as complete without a download, because iCloud rejects that request.
+Each cloud file is a placeholder. `ls` shows the size stored in iCloud, so you can see what opening it will download. The file allocates no local blocks until the bytes are here, so `du` and other disk-usage tools count it as empty. The bytes are written under `~/.cache/icloud-drive/blobs` in three cases: a program opens the file, you pin it, or you save a new file of your own. Unpinning a file that you have not edited removes that cache and leaves the name in place.
 
-Transfers run one at a time. Overlapping them makes the web API slower, not faster. The service asks Apple again about every five minutes. iCloud does not push changes to this client, so an edit from a phone shows up on the next check, or when you run `icloud-drive sync`.
+The download runs where a stall can be cancelled, so a stuck transfer does not freeze the file manager. Zero-byte files are recorded as complete without a download, because iCloud rejects that request.
 
-Pinned files are fetched in the background after sign-in and kept up to date. Everything else stays a name until you open it.
+Transfers run one at a time. Overlapping them makes the web API slower, not faster. The service asks Apple again about every five minutes. iCloud does not push changes to this client, so an edit from a phone shows up on the next check, or when you run `icloud-drive sync`. That refresh updates names. It does not pull the library down.
+
+Pinned files are fetched in the background after sign-in and kept up to date.
 
 ## Sign-in
 
@@ -83,6 +85,7 @@ install -D -m 0644 packaging/icloud-drive.service ~/.config/systemd/user/icloud-
 install -D -m 0644 packaging/icloud-drive.desktop ~/.local/share/applications/icloud-drive.desktop
 systemctl --user daemon-reload
 systemctl --user enable --now icloud-drive.service
+icloud-drive install-menus
 ```
 
 Logs:
@@ -101,8 +104,21 @@ journalctl --user -u icloud-drive.service -f
 | `icloud-drive status` | Show the current phase and anything that needs you |
 | `icloud-drive search notes` | Search the local filename index |
 | `icloud-drive pin PATH` | Keep a file or folder downloaded |
-| `icloud-drive unpin PATH` | Stop keeping it downloaded |
+| `icloud-drive unpin PATH` | Stop keeping it downloaded and drop the cached copy |
 | `icloud-drive sync` | Ask the service to check iCloud now |
+| `icloud-drive install-menus` | Add the right-click actions below |
+
+## Right-click
+
+The window's **File manager menu** switch adds or removes the items. It is on by default. `install-menus` turns it on without opening the window. Reopen the file manager after changing it.
+
+| File manager | Where it appears |
+| --- | --- |
+| COSMIC Files | **iC - Pin Download** and **iC - Unpin Download** on the menu. COSMIC shows custom actions for every file; choosing one outside this drive reports that and changes nothing. |
+| Dolphin | An **iCloud Drive** submenu with **Keep downloaded** and **Unpin** |
+| GNOME Files | **iC - Pin Download** and **iC - Unpin Download**, only for items inside the drive |
+
+GNOME Files needs the `nautilus-python` package. Restart the file manager after the items are installed.
 
 ## Config and data
 
@@ -111,6 +127,7 @@ Optional file: `~/.config/icloud-drive/config.toml`
 ```toml
 mount_point = "/home/you/iCloud Drive"
 allow_deletion = false
+file_browser = true
 poll_seconds = 300
 china = false
 ```
@@ -118,7 +135,7 @@ china = false
 | Path | What it holds |
 | --- | --- |
 | `~/.local/share/icloud-drive/index.sqlite3` | Names, pins, conflicts, and the trash queue |
-| `~/.cache/icloud-drive/blobs` | Downloaded file contents |
+| `~/.cache/icloud-drive/blobs` | Contents of files you have opened or pinned |
 | `~/.local/state/icloud-drive/session.json` | The signed-in session, mode `0600` |
 
 ## Layout

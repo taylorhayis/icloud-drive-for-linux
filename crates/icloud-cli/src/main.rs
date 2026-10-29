@@ -1,3 +1,4 @@
+mod menus;
 mod tray;
 
 use std::fs::OpenOptions;
@@ -18,6 +19,9 @@ use zbus::{interface, ConnectionBuilder};
 #[derive(Parser)]
 #[command(name = "icloud-drive", about = "iCloud Drive for Linux")]
 struct Cli {
+    /// Show a desktop notification with the result. Used by file-manager menus.
+    #[arg(long, global = true)]
+    notify: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -31,11 +35,19 @@ enum Command {
     /// Search the local filename index.
     Search { query: String },
     /// Keep a file or folder downloaded.
-    Pin { path: String },
+    Pin {
+        #[arg(required = true)]
+        paths: Vec<String>,
+    },
     /// Stop keeping a file or folder downloaded.
-    Unpin { path: String },
+    Unpin {
+        #[arg(required = true)]
+        paths: Vec<String>,
+    },
     /// Ask the service to refresh iCloud now.
     Sync,
+    /// Add Keep downloaded and Unpin to COSMIC Files, Dolphin, and GNOME Files.
+    InstallMenus,
     /// Follow the service log in the journal.
     Logs,
 }
@@ -44,6 +56,7 @@ enum Command {
 struct FileConfig {
     mount_point: Option<String>,
     allow_deletion: Option<bool>,
+    file_browser: Option<bool>,
     poll_seconds: Option<u32>,
     china: Option<bool>,
 }
@@ -55,6 +68,7 @@ struct Paths {
     config: PathBuf,
     mount: PathBuf,
     allow_deletion: bool,
+    file_browser: bool,
     poll_seconds: u32,
     china: bool,
 }
@@ -79,8 +93,9 @@ async fn run(cli: Cli) -> Result<(), String> {
         Command::Daemon => daemon().await,
         Command::Status => client_status().await,
         Command::Search { query } => client_search(&query).await,
-        Command::Pin { path } => client_pin(&path, true).await,
-        Command::Unpin { path } => client_pin(&path, false).await,
+        Command::Pin { paths } => client_pin(&paths, true, cli.notify).await,
+        Command::Unpin { paths } => client_pin(&paths, false, cli.notify).await,
+        Command::InstallMenus => install_menus(),
         Command::Sync => client_sync().await,
         Command::Logs => logs(),
     }
@@ -117,6 +132,10 @@ async fn daemon() -> Result<(), String> {
         .build()
         .await
         .map_err(|err| err.to_string())?;
+
+    if let Err(err) = apply_file_browser(&paths.config, paths.file_browser) {
+        tracing::warn!("file manager menus were not updated: {err}");
+    }
 
     let tray_engine = Arc::clone(&engine);
     let conn_for_tray = connection.clone();
@@ -257,6 +276,14 @@ impl DaemonService {
         self.engine.allow_deletion()
     }
 
+    fn set_file_browser(&self, enabled: bool) -> zbus::fdo::Result<()> {
+        apply_file_browser(&self.config_path, enabled).map_err(|err| zbus::fdo::Error::Failed(err))
+    }
+
+    fn file_browser(&self) -> bool {
+        file_browser_enabled(&self.config_path)
+    }
+
     fn resolve_attention(&self, id: i64, action: &str) -> zbus::fdo::Result<()> {
         self.engine
             .resolve_attention(id, action)
@@ -306,8 +333,10 @@ async fn client_status() -> Result<(), String> {
     if status.bytes_known && status.bytes_total > 0 {
         println!("file {} / {} bytes", status.bytes_done, status.bytes_total);
     }
-    if status.items_done > 0 {
-        println!("indexed {} folders", status.items_done);
+    if status.items_known && status.items_total > 0 {
+        println!("indexed {} / {} files", status.items_done, status.items_total);
+    } else if status.items_done > 0 {
+        println!("indexed {} files", status.items_done);
     }
     println!("{} item(s) need attention", status.attention_count);
     for item in proxy.attention().await.map_err(|err| err.to_string())? {
@@ -324,9 +353,89 @@ async fn client_search(query: &str) -> Result<(), String> {
     Ok(())
 }
 
-async fn client_pin(path: &str, pinned: bool) -> Result<(), String> {
+async fn client_pin(paths: &[String], pinned: bool, notify: bool) -> Result<(), String> {
+    let mount = load_paths()?.mount;
     let proxy = proxy().await?;
-    proxy.set_pinned(path, pinned).await.map_err(|err| err.to_string())
+    let mut done = Vec::new();
+    let mut failed = Vec::new();
+    for path in paths {
+        let drive = match menus::drive_path(&mount, path) {
+            Ok(drive) if drive == "/" => {
+                failed.push(format!("{path}: choose a file or folder inside the drive"));
+                continue;
+            }
+            Ok(drive) => drive,
+            Err(err) => {
+                failed.push(format!("{path}: {err}"));
+                continue;
+            }
+        };
+        match proxy.set_pinned(&drive, pinned).await {
+            Ok(()) => done.push(drive),
+            Err(err) => failed.push(format!("{path}: {err}")),
+        }
+    }
+    let verb = if pinned { "Keeping downloaded" } else { "Unpinned" };
+    if notify {
+        let mut lines = Vec::new();
+        if !done.is_empty() {
+            lines.push(format!("{verb}: {}", done.join(", ")));
+        }
+        lines.extend(failed.iter().cloned());
+        desktop_notify(&lines.join("\n"));
+    }
+    if failed.is_empty() {
+        if !notify {
+            for path in &done {
+                println!("{verb} {path}");
+            }
+        }
+        Ok(())
+    } else {
+        Err(failed.join("\n"))
+    }
+}
+
+fn install_menus() -> Result<(), String> {
+    let paths = load_paths()?;
+    apply_file_browser(&paths.config, true)
+}
+
+fn apply_file_browser(config: &std::path::Path, enabled: bool) -> Result<(), String> {
+    persist_setting(config, "file_browser", enabled).map_err(|err| err.to_string())?;
+    if enabled {
+        menus::install(&menus::binary_path()?)
+    } else {
+        menus::uninstall()
+    }
+}
+
+fn file_browser_enabled(config: &std::path::Path) -> bool {
+    std::fs::read_to_string(config)
+        .ok()
+        .and_then(|text| toml::from_str::<FileConfig>(&text).ok())
+        .and_then(|cfg| cfg.file_browser)
+        .unwrap_or(true)
+}
+
+fn desktop_notify(body: &str) {
+    let _ = std::process::Command::new("notify-send")
+        .args(["-a", "iCloud Drive", "iCloud Drive", body])
+        .status();
+}
+
+pub(crate) fn configured_mount(home: &std::path::Path) -> PathBuf {
+    let config_path = dirs::config_dir()
+        .unwrap_or_else(|| home.join(".config"))
+        .join("icloud-drive/config.toml");
+    let file_config = std::fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|text| toml::from_str::<FileConfig>(&text).ok())
+        .unwrap_or_default();
+    file_config
+        .mount_point
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join("iCloud Drive"))
 }
 
 async fn client_sync() -> Result<(), String> {
@@ -369,6 +478,7 @@ fn load_paths() -> Result<Paths, String> {
         config: config_path,
         mount,
         allow_deletion: file_config.allow_deletion.unwrap_or(false),
+        file_browser: file_config.file_browser.unwrap_or(true),
         poll_seconds: file_config.poll_seconds.unwrap_or(300),
         china: file_config.china.unwrap_or(false),
     })
@@ -380,16 +490,20 @@ fn load_session(path: &std::path::Path) -> Option<icloud_proto::SavedSession> {
 }
 
 fn persist_allow_deletion(path: &std::path::Path, enabled: bool) -> std::io::Result<()> {
+    persist_setting(path, "allow_deletion", enabled)
+}
+
+fn persist_setting(path: &std::path::Path, key: &str, enabled: bool) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let existing = std::fs::read_to_string(path).unwrap_or_default();
-    let line = format!("allow_deletion = {enabled}");
+    let line = format!("{key} = {enabled}");
     let mut found = false;
     let mut lines: Vec<String> = existing
         .lines()
         .map(|row| {
-            if row.trim_start().starts_with("allow_deletion") {
+            if row.trim_start().strip_prefix(key).is_some_and(|rest| rest.trim_start().starts_with('=')) {
                 found = true;
                 line.clone()
             } else {

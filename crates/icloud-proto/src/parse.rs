@@ -49,6 +49,11 @@ pub fn parse_created(body: &[u8]) -> (Option<String>, Option<String>, String) {
     )
 }
 
+pub fn parse_file_count(body: &Value) -> Option<u64> {
+    let node = body.as_array().and_then(|items| items.first()).unwrap_or(body);
+    node.get("fileCount").and_then(|v| v.as_u64())
+}
+
 pub fn parse_folder(body: &Value) -> Result<Vec<RemoteNode>, String> {
     let node = body
         .as_array()
@@ -173,5 +178,24 @@ mod tests {
     fn missing_items_is_an_error() {
         let err = parse_folder(&json![{"status": "NOT_FOUND"}]).unwrap_err();
         assert!(err.contains("NOT_FOUND"));
+    }
+
+    #[test]
+    fn root_file_count_is_the_drive_total() {
+        let body = json!([{
+            "drivewsid": "FOLDER::com.apple.CloudDocs::root",
+            "fileCount": 7,
+            "directChildrenCount": 1,
+            "items": [{
+                "drivewsid": "FILE::com.apple.CloudDocs::a",
+                "docwsid": "a",
+                "name": "Notes",
+                "extension": "txt",
+                "type": "FILE",
+                "size": 4,
+                "etag": "e"
+            }]
+        }]);
+        assert_eq!(parse_file_count(&body), Some(7));
     }
 }

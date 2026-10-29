@@ -17,6 +17,7 @@ struct Widgets {
     code: gtk::Entry,
     auth_status: gtk::Label,
     allow_deletion: gtk::Switch,
+    file_browser: gtk::Switch,
 }
 
 fn main() -> glib::ExitCode {
@@ -106,6 +107,21 @@ fn build(app: &adw::Application) {
     deletion_note.set_wrap(true);
     content.append(&deletion_note);
 
+    let browser_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    let browser_label = gtk::Label::new(Some("File manager menu"));
+    browser_label.set_hexpand(true);
+    browser_label.set_xalign(0.0);
+    let file_browser = gtk::Switch::new();
+    browser_row.append(&browser_label);
+    browser_row.append(&file_browser);
+    content.append(&browser_row);
+    let browser_note = gtk::Label::new(Some(
+        "Adds iC - Pin Download and iC - Unpin Download in COSMIC Files and GNOME Files, and an iCloud Drive menu in Dolphin. Reopen the file manager after changing this.",
+    ));
+    browser_note.set_xalign(0.0);
+    browser_note.set_wrap(true);
+    content.append(&browser_note);
+
     let open_folder = gtk::Button::with_label("Open iCloud Drive");
     content.append(&open_folder);
 
@@ -126,6 +142,7 @@ fn build(app: &adw::Application) {
         code,
         auth_status,
         allow_deletion,
+        file_browser,
     });
 
     let (tx, rx) = std::sync::mpsc::channel::<UiMsg>();
@@ -191,6 +208,19 @@ fn build(app: &adw::Application) {
         false.into()
     });
 
+    let browser_widgets = Rc::clone(&widgets);
+    widgets.file_browser.clone().connect_state_set(move |_, state| {
+        let enabled = state;
+        let _ = std::thread::spawn(move || {
+            let _ = block_on(async move {
+                let connection = zbus::Connection::session().await.ok()?;
+                let proxy = ServiceProxy::new(&connection).await.ok()?;
+                proxy.set_file_browser(enabled).await.ok()
+            });
+        });
+        false.into()
+    });
+
     open_folder.connect_clicked(|_| {
         let _ = std::thread::spawn(|| {
             let mount = block_on(async {
@@ -227,7 +257,9 @@ fn build(app: &adw::Application) {
         }
         if let Some(update) = poll {
             match update {
-                Some((status, attention, allow)) => apply_status(&tick_widgets, &status, &attention, allow),
+                Some((status, attention, allow, menus)) => {
+                    apply_status(&tick_widgets, &status, &attention, allow, menus)
+                }
                 None => {
                     tick_widgets.status.set_text("Sync service is not running");
                     tick_widgets.detail.set_text("Start it with icloud-drive daemon");
@@ -258,7 +290,13 @@ fn section_label(text: &str) -> gtk::Label {
     label
 }
 
-fn apply_status(widgets: &Widgets, status: &StatusSnapshot, attention: &[AttentionSnapshot], allow: bool) {
+fn apply_status(
+    widgets: &Widgets,
+    status: &StatusSnapshot,
+    attention: &[AttentionSnapshot],
+    allow: bool,
+    file_browser: bool,
+) {
     widgets.status.set_text(&status.label);
     let mut detail = status.phase.clone();
     if !status.current_path.is_empty() {
@@ -275,15 +313,25 @@ fn apply_status(widgets: &Widgets, status: &StatusSnapshot, attention: &[Attenti
             "{} / {} bytes",
             status.bytes_done, status.bytes_total
         )));
+    } else if status.phase == "indexing" && status.items_known && status.items_total > 0 {
+        let fraction = (status.items_done as f64 / status.items_total as f64).clamp(0.0, 1.0);
+        widgets.progress.set_fraction(fraction);
+        widgets.progress.set_text(Some(&format!(
+            "{} / {} files",
+            status.items_done, status.items_total
+        )));
     } else if status.phase == "indexing" {
         widgets.progress.pulse();
-        widgets.progress.set_text(Some(&format!("{} folders", status.items_done)));
+        widgets.progress.set_text(Some(&format!("{} files", status.items_done)));
     } else {
         widgets.progress.set_fraction(0.0);
         widgets.progress.set_text(Some(""));
     }
     if widgets.allow_deletion.state() != allow {
         widgets.allow_deletion.set_state(allow);
+    }
+    if widgets.file_browser.state() != file_browser {
+        widgets.file_browser.set_state(file_browser);
     }
     clear(&widgets.attention);
     for item in attention {
@@ -409,7 +457,7 @@ fn confirm_deletion(on_yes: impl Fn() + 'static) {
     dialog.present();
 }
 
-type PollUpdate = Option<(StatusSnapshot, Vec<AttentionSnapshot>, bool)>;
+type PollUpdate = Option<(StatusSnapshot, Vec<AttentionSnapshot>, bool, bool)>;
 
 enum UiMsg {
     Poll(PollUpdate),
@@ -423,7 +471,8 @@ async fn poll() -> PollUpdate {
     let status = proxy.status().await.ok()?;
     let attention = proxy.attention().await.ok()?;
     let allow = proxy.allow_deletion().await.unwrap_or(false);
-    Some((status, attention, allow))
+    let menus = proxy.file_browser().await.unwrap_or(true);
+    Some((status, attention, allow, menus))
 }
 
 fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {

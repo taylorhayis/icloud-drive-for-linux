@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::cookies::{CookieJar, StoredCookie};
-use crate::parse::{parse_container, parse_created, parse_download_url, parse_folder, RemoteNode};
+use crate::parse::{parse_container, parse_created, parse_download_url, parse_file_count, parse_folder, RemoteNode};
 use crate::srp_auth::{finish_srp, start_srp};
 use crate::{derive_password, ProtoError, Result, CONNECT_TIMEOUT, READ_TIMEOUT};
 
@@ -77,6 +77,8 @@ pub struct IcloudClient {
 #[derive(Debug, Clone)]
 pub struct FolderListing {
     pub docwsid: Option<String>,
+    /// Files in this folder and everything under it. On the drive root this is the library total.
+    pub file_count: Option<u64>,
     pub children: Vec<RemoteNode>,
 }
 
@@ -312,6 +314,7 @@ impl IcloudClient {
             .map_err(|err| ProtoError::Message(format!("Drive listing was not JSON: {err}")))?;
         Ok(FolderListing {
             docwsid: parse_container(&value).map(|(_, doc)| doc),
+            file_count: parse_file_count(&value),
             children: parse_folder(&value).map_err(ProtoError::Message)?,
         })
     }

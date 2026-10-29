@@ -18,12 +18,12 @@ pub fn mount_blocking(engine: Arc<Engine>, mount_point: &std::path::Path, rt: to
         MountOption::Subtype("icloud".into()),
         MountOption::DefaultPermissions,
     ];
-    fuser::mount2(
-        IcloudFs { engine, rt },
-        mount_point,
-        &options,
-    )
-    .map_err(|err| std::io::Error::other(err))
+    let mut session = fuser::Session::new(IcloudFs { engine: Arc::clone(&engine), rt }, mount_point, &options)?;
+    let notifier = session.notifier();
+    engine.on_directory_changed(move |ino| {
+        let _ = notifier.inval_inode(ino as u64, 0, -1);
+    });
+    session.run()
 }
 
 struct IcloudFs {
@@ -37,7 +37,13 @@ impl IcloudFs {
     }
 
     fn attr_of(&self, node: &Node, req: &Request<'_>) -> FileAttr {
-        file_attr(node.ino as u64, node.size, node.kind, node.mtime_ms, req)
+        let resident = node.kind == NodeKind::File
+            && node.complete
+            && node
+                .blob
+                .as_deref()
+                .is_some_and(|path| std::path::Path::new(path).is_file());
+        file_attr(node.ino as u64, node.size, node.kind, node.mtime_ms, resident, req)
     }
 }
 
@@ -269,17 +275,13 @@ impl Filesystem for IcloudFs {
     }
 }
 
-fn file_attr(ino: u64, size: u64, kind: NodeKind, mtime_ms: i64, req: &Request<'_>) -> FileAttr {
-    let kind = if kind == NodeKind::Directory {
-        FileType::Directory
-    } else {
-        FileType::RegularFile
-    };
+fn file_attr(ino: u64, size: u64, kind: NodeKind, mtime_ms: i64, resident: bool, req: &Request<'_>) -> FileAttr {
+    let (size, blocks, kind) = presented(size, kind, resident);
     let time = UNIX_EPOCH + Duration::from_millis(mtime_ms.max(0) as u64);
     FileAttr {
         ino,
         size,
-        blocks: size.div_ceil(512),
+        blocks,
         atime: time,
         mtime: time,
         ctime: time,
@@ -295,8 +297,43 @@ fn file_attr(ino: u64, size: u64, kind: NodeKind, mtime_ms: i64, req: &Request<'
     }
 }
 
+/// Cloud files keep the size iCloud reported, and allocate no local blocks until
+/// the bytes are actually in the cache. `du` and other disk-usage tools read
+/// `blocks`, so a 2 TB library stays tiny until a file is opened or pinned.
+fn presented(size: u64, kind: NodeKind, resident: bool) -> (u64, u64, FileType) {
+    if kind == NodeKind::Directory {
+        return (4096, 8, FileType::Directory);
+    }
+    let blocks = if resident { size.div_ceil(512) } else { 0 };
+    (size, blocks, FileType::RegularFile)
+}
+
 fn synthetic_attr(req: &Request<'_>) -> FileAttr {
-    file_attr(TRACKER_INO, 0, NodeKind::File, 0, req)
+    file_attr(TRACKER_INO, 0, NodeKind::File, 0, false, req)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cloud_files_allocate_nothing_until_the_bytes_are_local() {
+        let (size, blocks, kind) = presented(2u64 << 40, NodeKind::File, false);
+        assert_eq!(kind, FileType::RegularFile);
+        assert_eq!(size, 2u64 << 40);
+        assert_eq!(blocks, 0);
+        let (size, blocks, _) = presented(2u64 << 40, NodeKind::File, true);
+        assert_eq!(size, 2u64 << 40);
+        assert!(blocks > 0);
+    }
+
+    #[test]
+    fn directories_do_not_advertise_the_cloud_library_size() {
+        let (size, blocks, kind) = presented(2u64 << 40, NodeKind::Directory, false);
+        assert_eq!(kind, FileType::Directory);
+        assert_eq!(size, 4096);
+        assert_eq!(blocks, 8);
+    }
 }
 
 fn errno(err: &EngineError) -> i32 {

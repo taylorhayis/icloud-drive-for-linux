@@ -3,6 +3,7 @@
 mod blobs;
 mod db;
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -112,6 +113,7 @@ pub struct Engine {
     wake: Notify,
     poll_seconds: AtomicU32,
     shutdown: CancellationToken,
+    dir_changed: Mutex<Option<Arc<dyn Fn(i64) + Send + Sync>>>,
 }
 
 impl Engine {
@@ -138,7 +140,13 @@ impl Engine {
             wake: Notify::new(),
             poll_seconds: AtomicU32::new(poll_seconds.max(30)),
             shutdown: CancellationToken::new(),
+            dir_changed: Mutex::new(None),
         })
+    }
+
+    /// Called after a folder's names are written, so the mount can refresh that directory.
+    pub fn on_directory_changed(&self, listener: impl Fn(i64) + Send + Sync + 'static) {
+        *self.dir_changed.lock().expect("dir") = Some(Arc::new(listener));
     }
 
     pub fn status(&self) -> SyncStatus {
@@ -259,31 +267,43 @@ impl Engine {
             return Ok(());
         }
         self.db.lock().expect("db").dismiss_kind(AttentionKind::NeedsAuth)?;
-        self.set_status(Phase::Indexing, "Indexing iCloud Drive", "/", 0, None, 0, None);
-        let mut queue = vec![ROOT_DRIVEWSID.to_string()];
-        let mut done = 0u64;
-        while let Some(drivewsid) = queue.pop() {
+        let mut queue = VecDeque::from([ROOT_DRIVEWSID.to_string()]);
+        let mut seen = std::collections::HashSet::from([ROOT_DRIVEWSID.to_string()]);
+        let mut total_files: Option<u64> = None;
+        while let Some(drivewsid) = queue.pop_front() {
             if self.shutdown.is_cancelled() {
                 return Err(EngineError::Cancelled);
             }
             let started = now_ms();
             let parent = self.db.lock().expect("db").ino_for_drivewsid(&drivewsid)?;
+            let path = self.db.lock().expect("db").path_of(parent).unwrap_or_else(|_| "/".into());
+            self.report_index(&path, total_files);
             let listed = {
                 let _permit = self.transfers.acquire().await.map_err(|_| EngineError::Cancelled)?;
                 self.client.lock().await.list_folder(&drivewsid).await
             };
             match listed {
                 Ok(listing) => {
+                    if drivewsid == ROOT_DRIVEWSID {
+                        total_files = listing.file_count.or(total_files);
+                    }
                     if let Some(doc) = listing.docwsid.filter(|doc| !doc.is_empty() && doc != "root") {
                         self.db.lock().expect("db").set_docwsid(&drivewsid, &doc)?;
                     }
-                    let folders = self.db.lock().expect("db").apply_snapshot(
+                    let (folders, changed) = self.db.lock().expect("db").apply_snapshot(
                         parent,
                         started,
                         true,
                         &listing.children,
                     )?;
-                    queue.extend(folders);
+                    for folder in folders {
+                        if seen.insert(folder.clone()) {
+                            queue.push_back(folder);
+                        }
+                    }
+                    if changed {
+                        self.note_directory(parent);
+                    }
                 }
                 Err(ProtoError::Api { status, message }) if status == 423 || status == 401 => {
                     let kind = if status == 401 {
@@ -292,11 +312,11 @@ impl Engine {
                         AttentionKind::NeedsAdp
                     };
                     self.db.lock().expect("db").raise(kind, Some(parent), "/", &message)?;
-                    self.set_status(Phase::NeedsAuth, &message, "", 0, None, done, None);
+                    let files = self.db.lock().expect("db").indexed_file_count().unwrap_or(0);
+                    self.set_status(Phase::NeedsAuth, &message, "", 0, None, files, total_files);
                     return Ok(());
                 }
                 Err(err) => {
-                    let path = self.db.lock().expect("db").path_of(parent).unwrap_or_else(|_| "/".into());
                     self.db.lock().expect("db").apply_snapshot(parent, started, false, &[])?;
                     self.db.lock().expect("db").raise(
                         AttentionKind::FolderSkipped,
@@ -306,13 +326,13 @@ impl Engine {
                     )?;
                 }
             }
-            done += 1;
-            self.set_status(Phase::Indexing, "Indexing iCloud Drive", "", 0, None, done, None);
+            self.report_index(&path, total_files);
         }
         self.hydrate_pins().await?;
         self.upload_dirty().await?;
         self.flush_trash().await?;
-        self.set_status(Phase::Idle, "Up to date", "", 0, None, done, Some(done));
+        let files = self.db.lock().expect("db").indexed_file_count().unwrap_or(0);
+        self.set_status(Phase::Idle, "Up to date", "", 0, None, files, Some(files));
         Ok(())
     }
 
@@ -416,7 +436,32 @@ impl Engine {
         self.db.lock().expect("db").set_pin_tree(ino, pin)?;
         if pin {
             self.wake.notify_waiters();
+        } else {
+            self.evict_unpinned(ino)?;
         }
+        Ok(())
+    }
+
+    /// Drop cached bytes for a file that is no longer pinned and has no local edits.
+    /// Metadata stays, so the name remains a placeholder.
+    fn evict_unpinned(&self, ino: i64) -> Result<()> {
+        let node = self.db.lock().expect("db").node(ino)?;
+        if node.kind == NodeKind::Directory {
+            let children = self.db.lock().expect("db").children(ino)?;
+            for child in children {
+                self.evict_unpinned(child.ino)?;
+            }
+            return Ok(());
+        }
+        if node.pin || node.dirty {
+            return Ok(());
+        }
+        if let Some(blob) = node.blob.as_deref() {
+            let _ = std::fs::remove_file(blob);
+        }
+        let _ = std::fs::remove_file(self.blobs.path_for(ino));
+        let _ = std::fs::remove_file(self.blobs.temp_for(ino));
+        self.db.lock().expect("db").forget_local_bytes(ino)?;
         Ok(())
     }
 
@@ -816,6 +861,18 @@ impl Engine {
             AuthStep::Failed(message) => {
                 let _ = db.raise(AttentionKind::NeedsAuth, None, "/", message);
             }
+        }
+    }
+
+    fn report_index(&self, path: &str, total_files: Option<u64>) {
+        let files = self.db.lock().expect("db").indexed_file_count().unwrap_or(0);
+        self.set_status(Phase::Indexing, "Indexing iCloud Drive", path, 0, None, files, total_files);
+    }
+
+    fn note_directory(&self, ino: i64) {
+        let listener = self.dir_changed.lock().expect("dir").clone();
+        if let Some(listener) = listener {
+            listener(ino);
         }
     }
 

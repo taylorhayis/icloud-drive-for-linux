@@ -51,6 +51,8 @@ pub trait Service {
     fn set_pinned(&self, path: &str, pinned: bool) -> zbus::Result<()>;
     fn set_allow_deletion(&self, enabled: bool) -> zbus::Result<()>;
     fn allow_deletion(&self) -> zbus::Result<bool>;
+    fn set_file_browser(&self, enabled: bool) -> zbus::Result<()>;
+    fn file_browser(&self) -> zbus::Result<bool>;
     fn resolve_attention(&self, id: i64, action: &str) -> zbus::Result<()>;
     fn sync_now(&self) -> zbus::Result<()>;
     fn mount_point(&self) -> zbus::Result<String>;

@@ -258,15 +258,18 @@ impl Db {
         started_ms: i64,
         completed: bool,
         children: &[RemoteNode],
-    ) -> Result<Vec<String>> {
+    ) -> Result<(Vec<String>, bool)> {
         if !completed {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         }
         let mut folders = Vec::new();
+        let mut changed = false;
         let seen: Vec<String> = children.iter().map(|child| child.drivewsid.clone()).collect();
         let parent_drive = self.node(parent)?.drivewsid.unwrap_or_default();
         for child in children {
-            self.upsert_remote(parent, &parent_drive, child)?;
+            if self.upsert_remote(parent, &parent_drive, child)? {
+                changed = true;
+            }
             if child.kind == RemoteKind::Folder {
                 folders.push(child.drivewsid.clone());
             }
@@ -293,8 +296,22 @@ impl Db {
                 continue;
             }
             self.remove_node(node.ino)?;
+            changed = true;
         }
-        Ok(folders)
+        if changed {
+            self.conn.execute(
+                "UPDATE items SET mtime_ms = ?1 WHERE ino = ?2",
+                params![now_ms(), parent],
+            )?;
+        }
+        Ok((folders, changed))
+    }
+
+    pub fn indexed_file_count(&self) -> Result<u64> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM items WHERE node_type = 'file'", [], |row| row.get(0))?;
+        Ok(count.max(0) as u64)
     }
 
     fn upsert_remote(&mut self, parent: i64, parent_drivewsid: &str, child: &RemoteNode) -> Result<bool> {
