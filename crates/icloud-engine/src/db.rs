@@ -77,6 +77,8 @@ pub struct Node {
     pub parent: i64,
     pub name: String,
     pub name_apple: String,
+    /// Apple stores this separately from `name_apple`. Empty when the file has no extension.
+    pub extension: String,
     pub remote_parent: Option<String>,
     pub kind: NodeKind,
     pub size: u64,
@@ -181,6 +183,7 @@ impl Db {
         )?;
         self.ensure_column("remote_parent", "remote_parent TEXT")?;
         self.ensure_column("bytes_fetched", "bytes_fetched INTEGER NOT NULL DEFAULT 0")?;
+        self.ensure_column("extension", "extension TEXT NOT NULL DEFAULT ''")?;
         self.conn.execute(
             "UPDATE items SET bytes_fetched = 1 WHERE complete = 1 AND size > 0 AND bytes_fetched = 0",
             [],
@@ -344,25 +347,37 @@ impl Db {
             RemoteKind::File => NodeKind::File,
             RemoteKind::Folder => NodeKind::Directory,
         };
+        let extension = child.extension.clone().unwrap_or_default();
         if let Some(existing) = self.by_drivewsid(&child.drivewsid)? {
             if existing.name == child.name_local
                 && existing.etag == child.etag
                 && existing.size == child.size
                 && existing.mtime_ms == child.mtime_ms
                 && existing.parent == parent
+                && existing.name_apple == child.name_apple
+                && existing.extension == extension
             {
                 if !parent_drivewsid.is_empty() && existing.remote_parent.as_deref() != Some(parent_drivewsid) {
                     self.set_remote_parent(existing.ino, parent_drivewsid)?;
                 }
                 return Ok(false);
             }
-            if existing.dirty && existing.size != child.size {
+            if existing.dirty {
                 let path = self.path_of(existing.ino)?;
-                self.raise(AttentionKind::Conflict, Some(existing.ino), &path, "This file changed here and on iCloud")?;
-                self.conn.execute(
-                    "UPDATE items SET drivewsid = ?1, docwsid = ?2, etag = ?3 WHERE ino = ?4",
-                    params![child.drivewsid, child.docwsid, child.etag, existing.ino],
-                )?;
+                let remote_changed = !child.etag.is_empty() && child.etag != existing.etag;
+                if remote_changed {
+                    self.raise(AttentionKind::Conflict, Some(existing.ino), &path, "This file changed here and on iCloud")?;
+                    self.conn.execute(
+                        "UPDATE items SET docwsid = ?1, etag = ?2, name_apple = ?3, extension = ?4 WHERE ino = ?5",
+                        params![child.docwsid, child.etag, child.name_apple, extension, existing.ino],
+                    )?;
+                } else {
+                    let _ = self.dismiss_path(AttentionKind::Conflict, &path);
+                    self.conn.execute(
+                        "UPDATE items SET docwsid = ?1, name_apple = ?2, extension = ?3 WHERE ino = ?4",
+                        params![child.docwsid, child.name_apple, extension, existing.ino],
+                    )?;
+                }
                 return Ok(true);
             }
             let still_complete = if !existing.dirty && existing.complete && existing.bytes_fetched && existing.size == child.size {
@@ -375,8 +390,8 @@ impl Db {
                 existing.complete as i64
             };
             self.conn.execute(
-                "UPDATE items SET parent_ino = ?1, name_apple = ?2, name_local = ?3, node_type = ?4, size = ?5, etag = ?6, mtime_ms = ?7, docwsid = ?8, complete = ?9, revision = revision + 1, last_synced_ms = ?10 WHERE ino = ?11",
-                params![parent, child.name_apple, child.name_local, kind.as_str(), child.size as i64, child.etag, child.mtime_ms, child.docwsid, still_complete, now_ms(), existing.ino],
+                "UPDATE items SET parent_ino = ?1, name_apple = ?2, name_local = ?3, extension = ?4, node_type = ?5, size = ?6, etag = ?7, mtime_ms = ?8, docwsid = ?9, complete = ?10, revision = revision + 1, last_synced_ms = ?11 WHERE ino = ?12",
+                params![parent, child.name_apple, child.name_local, extension, kind.as_str(), child.size as i64, child.etag, child.mtime_ms, child.docwsid, still_complete, now_ms(), existing.ino],
             )?;
             self.reindex(existing.ino, &child.name_local)?;
             return Ok(true);
@@ -384,17 +399,17 @@ impl Db {
         if let Some(local) = self.child(parent, &child.name_local)? {
             if local.drivewsid.is_none() {
                 self.conn.execute(
-                    "UPDATE items SET drivewsid = ?1, docwsid = ?2, etag = ?3, name_apple = ?4, revision = revision + 1 WHERE ino = ?5",
-                    params![child.drivewsid, child.docwsid, child.etag, child.name_apple, local.ino],
+                    "UPDATE items SET drivewsid = ?1, docwsid = ?2, etag = ?3, name_apple = ?4, extension = ?5, revision = revision + 1 WHERE ino = ?6",
+                    params![child.drivewsid, child.docwsid, child.etag, child.name_apple, extension, local.ino],
                 )?;
                 return Ok(true);
             }
         }
         let ino = self.next_ino()?;
             self.conn.execute(
-                "INSERT INTO items (ino, parent_ino, drivewsid, docwsid, name_apple, name_local, node_type, size, etag, mtime_ms, complete, last_synced_ms, revision, remote_parent)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, 1, ?12)",
-            params![ino, parent, child.drivewsid, child.docwsid, child.name_apple, child.name_local, kind.as_str(), child.size as i64, child.etag, child.mtime_ms, now_ms(), parent_drivewsid],
+                "INSERT INTO items (ino, parent_ino, drivewsid, docwsid, name_apple, name_local, extension, node_type, size, etag, mtime_ms, complete, last_synced_ms, revision, remote_parent)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12, 1, ?13)",
+            params![ino, parent, child.drivewsid, child.docwsid, child.name_apple, child.name_local, extension, kind.as_str(), child.size as i64, child.etag, child.mtime_ms, now_ms(), parent_drivewsid],
         )?;
         self.conn.execute("INSERT INTO items_fts (name, ino) VALUES (?1, ?2)", params![child.name_local, ino.to_string()])?;
         Ok(true)
@@ -757,6 +772,15 @@ impl Db {
             .ok_or(EngineError::NotFound)
     }
 
+    pub fn has_open(&self, kind: AttentionKind, ino: i64) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM attention WHERE kind = ?1 AND ino = ?2 AND dismissed = 0",
+            params![kind.as_str(), ino],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     pub fn attention_count(&self) -> Result<u32> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM attention WHERE dismissed = 0",
@@ -813,6 +837,7 @@ fn map_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
         parent: row.get("parent_ino")?,
         name: row.get("name_local")?,
         name_apple: row.get("name_apple")?,
+        extension: row.get("extension")?,
         remote_parent: row.get("remote_parent")?,
         kind: NodeKind::parse(&row.get::<_, String>("node_type")?),
         size: row.get::<_, i64>("size")? as u64,
@@ -994,6 +1019,42 @@ mod tests {
         db.mark_complete(node.ino, Path::new("/tmp/empty.txt"), 0).unwrap();
         assert!(db.empty_stubs().unwrap().is_empty());
         assert!(db.node(node.ino).unwrap().bytes_fetched);
+    }
+
+    #[test]
+    fn local_edit_keeps_its_bytes_when_icloud_is_unchanged() {
+        let mut db = Db::open_memory().unwrap();
+        let mut child = file("a", "Case.sc", 10, "e1");
+        child.name_apple = "Case".into();
+        child.extension = Some("sc".into());
+        db.apply_snapshot(ROOT_INO, 1, true, &[child.clone()]).unwrap();
+        let node = db.child(ROOT_INO, "Case.sc").unwrap().unwrap();
+        db.mark_complete(node.ino, Path::new("/tmp/Case.sc"), 20).unwrap();
+        db.mark_dirty(node.ino).unwrap();
+        db.raise(AttentionKind::Conflict, Some(node.ino), "/Case.sc", "stale").unwrap();
+        db.apply_snapshot(ROOT_INO, 2, true, &[child]).unwrap();
+        let node = db.node(node.ino).unwrap();
+        assert!(node.dirty);
+        assert_eq!(node.size, 20);
+        assert_eq!(node.name, "Case.sc");
+        assert_eq!(node.name_apple, "Case");
+        assert_eq!(node.extension, "sc");
+        assert!(!db.has_open(AttentionKind::Conflict, node.ino).unwrap());
+    }
+
+    #[test]
+    fn remote_edit_while_the_file_is_dirty_is_a_conflict() {
+        let mut db = Db::open_memory().unwrap();
+        let child = file("a", "Notes.txt", 4, "e1");
+        db.apply_snapshot(ROOT_INO, 1, true, &[child]).unwrap();
+        let node = db.child(ROOT_INO, "Notes.txt").unwrap().unwrap();
+        db.mark_complete(node.ino, Path::new("/tmp/Notes.txt"), 9).unwrap();
+        db.mark_dirty(node.ino).unwrap();
+        db.apply_snapshot(ROOT_INO, 2, true, &[file("a", "Notes.txt", 8, "e2")]).unwrap();
+        let node = db.node(node.ino).unwrap();
+        assert!(node.dirty);
+        assert_eq!(node.size, 9);
+        assert!(db.has_open(AttentionKind::Conflict, node.ino).unwrap());
     }
 
     #[test]

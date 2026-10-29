@@ -956,6 +956,9 @@ impl Engine {
         self.set_status(Phase::Uploading, "Uploading", "", 0, None, 0, Some(dirty.len() as u64));
         for node in dirty {
             let path = self.db.lock().expect("db").path_of(node.ino).unwrap_or(node.name.clone());
+            if self.db.lock().expect("db").has_open(AttentionKind::Conflict, node.ino)? {
+                continue;
+            }
             if let Err(err) = self.place_remote(&node).await {
                 self.db.lock().expect("db").raise(
                     AttentionKind::StalledUpload,
@@ -989,6 +992,7 @@ impl Engine {
                 Ok(()) => {
                     self.db.lock().expect("db").clear_dirty(node.ino)?;
                     self.db.lock().expect("db").dismiss_path(AttentionKind::StalledUpload, &path)?;
+                    self.db.lock().expect("db").dismiss_path(AttentionKind::Conflict, &path)?;
                     self.note_activity("uploaded", &path, &format_bytes(node.size));
                 }
                 Err(err) => {
@@ -1071,7 +1075,7 @@ impl Engine {
         };
         let parent = self.db.lock().expect("db").node(node.parent)?;
         let parent_id = parent.drivewsid.clone().unwrap_or_default();
-        if !node.name_apple.is_empty() && node.name != node.name_apple {
+        if !node.name_apple.is_empty() && !remote_name_matches(&node.name_apple, &node.extension, &node.name) {
             let _permit = self.transfers.acquire().await.map_err(|_| EngineError::Cancelled)?;
             self.client
                 .lock()
@@ -1316,6 +1320,14 @@ fn directory_is_mounted(folder: &Path) -> bool {
     })
 }
 
+/// Apple keeps the extension in its own field, so `Case` plus `sc` is already `Case.sc`.
+fn remote_name_matches(name_apple: &str, extension: &str, name_local: &str) -> bool {
+    if name_apple == name_local {
+        return true;
+    }
+    !extension.is_empty() && name_local == format!("{name_apple}.{extension}")
+}
+
 fn clean_name(name: &str) -> Result<String> {
     if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
         return Err(EngineError::InvalidName);
@@ -1334,12 +1346,20 @@ fn now_ms() -> i64 {
 mod tests {
     use super::{local_copy_is_ready, path_is_synced, Node, NodeKind};
 
+    #[test]
+    fn apple_extension_is_not_a_local_rename() {
+        assert!(super::remote_name_matches("Cyberpunk_PC_Case", "sc", "Cyberpunk_PC_Case.sc"));
+        assert!(super::remote_name_matches("Notes.txt", "", "Notes.txt"));
+        assert!(!super::remote_name_matches("Cyberpunk_PC_Case", "sc", "Other.sc"));
+    }
+
     fn sample(bytes_fetched: bool, size: u64, blob: Option<&str>, dirty: bool) -> Node {
         Node {
             ino: 2,
             parent: 1,
             name: "a.jpg".into(),
             name_apple: "a.jpg".into(),
+            extension: String::new(),
             remote_parent: None,
             kind: NodeKind::File,
             size,

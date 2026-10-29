@@ -405,11 +405,12 @@ impl IcloudClient {
         let ticket = json!({
             "filename": filename,
             "type": "FILE",
-            "content_type": "application/octet-stream",
+            "content_type": content_type_for(filename),
             "size": size,
         });
-        let (status, _, bytes) = self.send("POST", &url, Some(ticket.to_string()), true).await?;
-        self.ensure_ok(status, &bytes)?;
+        // CloudDocs rejects application/json with "Unexpected input".
+        let (status, _, bytes) = self.post_plain(&url, ticket.to_string()).await?;
+        self.ensure_ok(status, &bytes).map_err(|err| annotate("reserving the upload", err))?;
         let tickets: Value = serde_json::from_slice(&bytes)
             .map_err(|err| ProtoError::Message(format!("upload ticket was not JSON: {err}")))?;
         let first = tickets
@@ -447,38 +448,49 @@ impl IcloudClient {
         let status = response.status();
         let bytes = response.bytes().await?;
         self.remember_headers(status, &content_url, &HeaderMap::new());
-        self.ensure_ok(status, &bytes)?;
+        self.ensure_ok(status, &bytes).map_err(|err| annotate("sending the file", err))?;
         let uploaded: Value = serde_json::from_slice(&bytes)
             .map_err(|err| ProtoError::Message(format!("upload response was not JSON: {err}")))?;
         let single = uploaded
             .get("singleFile")
             .cloned()
             .ok_or_else(|| ProtoError::Message("upload response had no file receipt".into()))?;
+        let signature = single.get("fileChecksum").cloned().unwrap_or(Value::Null);
+        let wrapping_key = single.get("wrappingKey").cloned().unwrap_or(Value::Null);
+        let reference_signature = single.get("referenceChecksum").cloned().unwrap_or(Value::Null);
+        let file_size = single.get("size").cloned().unwrap_or(json!(size));
+        let receipt = single.get("receipt").cloned();
+        let now = chrono::Utc::now().timestamp_millis();
         let mut data = json!({
-            "signature": single.get("fileChecksum").cloned().unwrap_or(Value::Null),
-            "wrapping_key": single.get("wrappingKey").cloned().unwrap_or(Value::Null),
-            "reference_signature": single.get("referenceChecksum").cloned().unwrap_or(Value::Null),
-            "size": single.get("size").cloned().unwrap_or(json!(size)),
+            "signature": signature,
+            "wrapping_key": wrapping_key,
+            "reference_signature": reference_signature,
+            "size": file_size,
         });
-        if let Some(receipt) = single.get("receipt") {
-            data["receipt"] = receipt.clone();
+        if let Some(receipt) = receipt {
+            data["receipt"] = receipt;
         }
-        let command = if existing_docwsid.is_some() { "update_file" } else { "add_file" };
-        let document_id = existing_docwsid.unwrap_or(&document_id).to_string();
+        // A new document id is only for a file that does not exist yet. Replacing one
+        // reuses its document id, and allow_conflict must stay off or iCloud saves a copy.
+        let (command_id, allow_conflict, short_guid) = if let Some(existing) = existing_docwsid.filter(|id| !id.is_empty()) {
+            (existing.to_string(), false, false)
+        } else {
+            (document_id, true, true)
+        };
         let update = json!({
             "data": data,
-            "command": command,
-            "create_short_guid": true,
-            "document_id": document_id,
+            "command": "add_file",
+            "create_short_guid": short_guid,
+            "document_id": command_id,
             "path": { "starting_document_id": folder_docwsid, "path": filename },
-            "allow_conflict": true,
+            "allow_conflict": allow_conflict,
             "file_flags": { "is_writable": true, "is_executable": false, "is_hidden": false },
-            "mtime": chrono::Utc::now().timestamp_millis(),
-            "btime": chrono::Utc::now().timestamp_millis(),
+            "mtime": now,
+            "btime": now,
         });
         let update_url = format!("{doc}/ws/com.apple.CloudDocs/update/documents");
-        let (status, _, bytes) = self.send("POST", &update_url, Some(update.to_string()), true).await?;
-        self.ensure_ok(status, &bytes)?;
+        let (status, _, bytes) = self.post_plain(&update_url, update.to_string()).await?;
+        self.ensure_ok(status, &bytes).map_err(|err| annotate("saving the file on iCloud", err))?;
         Ok(())
     }
 
@@ -513,7 +525,7 @@ impl IcloudClient {
             "folders": [{ "clientId": client_id, "name": name }]
         });
         let (status, _, bytes) = self
-            .send("POST", &format!("{root}/createFolders"), Some(body.to_string()), true)
+            .post_plain(&format!("{root}/createFolders"), body.to_string())
             .await?;
         self.ensure_ok(status, &bytes)?;
         let (drivewsid, docwsid, etag) = parse_created(&bytes);
@@ -677,12 +689,28 @@ impl IcloudClient {
         format!("{base}{path}")
     }
 
+    async fn post_plain(&self, url: &str, body: String) -> Result<(StatusCode, HeaderMap, Vec<u8>)> {
+        self.dispatch("POST", url, Some(body), false, "text/plain").await
+    }
+
     async fn send(
         &self,
         method: &str,
         url: &str,
         body: Option<String>,
         idmsa: bool,
+    ) -> Result<(StatusCode, HeaderMap, Vec<u8>)> {
+        let content_type = if body.is_some() { "application/json" } else { "" };
+        self.dispatch(method, url, body, idmsa, content_type).await
+    }
+
+    async fn dispatch(
+        &self,
+        method: &str,
+        url: &str,
+        body: Option<String>,
+        idmsa: bool,
+        content_type: &str,
     ) -> Result<(StatusCode, HeaderMap, Vec<u8>)> {
         let parsed = Url::parse(url).map_err(|err| ProtoError::Message(err.to_string()))?;
         let mut request = self.http.request(method.parse().expect("method"), url);
@@ -697,7 +725,10 @@ impl IcloudClient {
             }
         }
         if let Some(body) = body {
-            request = request.header(CONTENT_TYPE, "application/json").body(body);
+            if !content_type.is_empty() {
+                request = request.header(CONTENT_TYPE, content_type);
+            }
+            request = request.body(body);
         }
         let response = request.send().await?;
         let status = response.status();
@@ -880,6 +911,28 @@ fn value_mentions_terms(value: &Value) -> bool {
         .to_string()
         .to_ascii_lowercase()
         .contains("terms of service")
+}
+
+fn content_type_for(filename: &str) -> &'static str {
+    match filename.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase()).as_deref() {
+        Some("txt" | "md") => "text/plain",
+        Some("json") => "application/json",
+        Some("pdf") => "application/pdf",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("mp4") => "video/mp4",
+        Some("zip") => "application/zip",
+        _ => "",
+    }
+}
+
+fn annotate(step: &str, err: ProtoError) -> ProtoError {
+    match err {
+        ProtoError::Api { status, message } => ProtoError::Api { status, message: format!("{step}: {message}") },
+        ProtoError::Message(message) => ProtoError::Message(format!("{step}: {message}")),
+        other => other,
+    }
 }
 
 fn urlencoding(value: &str) -> String {
