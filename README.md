@@ -89,6 +89,14 @@ systemctl --user daemon-reload
 systemctl --user enable --now icloud-drive.service
 ```
 
+The window has **Start when you log in**. That writes an autostart entry which launches the window hidden and starts sync. The panel icon opens the window. If sync stops on its own, the window opens and a notification tells you to press **Start**. **Quit** stops sync without that alert.
+
+A Flatpak bundle is attached to the [GitHub release](https://github.com/taylorhayis/icloud-drive-for-linux/releases). It uses the same window and saves into the real `~/iCloud Drive` folder. The first launch asks you to sign in again. Later launches reuse that session.
+
+```bash
+flatpak install --user icloud-drive-0.2.0.flatpak
+```
+
 Logs:
 
 ```bash

@@ -3,3 +3,6 @@
 *.sqlite
 *.sqlite-*
 .DS_Store
+.flatpak-builder/
+/repo/
+*.flatpak

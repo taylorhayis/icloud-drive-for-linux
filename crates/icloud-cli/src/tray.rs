@@ -104,6 +104,15 @@ pub async fn run(
     }
 }
 
+fn open_window() {
+    let binary = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|dir| dir.join("icloud-drive-gui")))
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| std::path::PathBuf::from("icloud-drive-gui"));
+    let _ = std::process::Command::new(binary).spawn();
+}
+
 struct TrayItem {
     engine: Arc<Engine>,
     pixmap: std::sync::Mutex<Vec<(i32, i32, Vec<u8>)>>,
@@ -114,7 +123,7 @@ struct TrayItem {
 #[interface(name = "org.kde.StatusNotifierItem")]
 impl TrayItem {
     fn activate(&self, _x: i32, _y: i32) {
-        let _ = std::process::Command::new("icloud-drive-gui").spawn();
+        open_window();
     }
 
     fn secondary_activate(&self, _x: i32, _y: i32) {}
@@ -230,7 +239,7 @@ impl TrayMenu {
             return;
         }
         if id == OPEN_ITEM {
-            let _ = std::process::Command::new("icloud-drive-gui").spawn();
+            open_window();
         } else if id == QUIT_ITEM {
             let _ = self.stop.send(true);
         }

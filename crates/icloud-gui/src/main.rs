@@ -1,12 +1,17 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures_util::StreamExt;
 
 use adw::prelude::*;
+use gtk::gio;
 use gtk::glib::{self, ControlFlow};
 use icloud_ipc::{AttentionSnapshot, ServiceProxy, StatusSnapshot};
+
+/// Set by the command line before the first window is built.
+static LAUNCH_IN_BACKGROUND: AtomicBool = AtomicBool::new(false);
 
 struct Widgets {
     status: gtk::Label,
@@ -29,6 +34,8 @@ struct Widgets {
     allow_deletion: gtk::Switch,
     start: gtk::Button,
     quit: gtk::Button,
+    crash_alerted: Cell<bool>,
+    seen_service: Cell<bool>,
     folder_path: gtk::Label,
     folder_list: gtk::ListBox,
     sync_roots: gtk::ListBox,
@@ -41,17 +48,33 @@ struct Widgets {
 fn main() -> glib::ExitCode {
     let app = adw::Application::builder()
         .application_id("dev.icloud_drive.Gui")
+        .flags(gio::ApplicationFlags::HANDLES_COMMAND_LINE)
         .build();
+    app.connect_command_line(|app, command_line| {
+        if let Some(window) = app.windows().first().cloned() {
+            window.present();
+            return 0;
+        }
+        let background = command_line.arguments().iter().any(|arg| arg == "--background");
+        LAUNCH_IN_BACKGROUND.store(background, Ordering::Relaxed);
+        app.activate();
+        0
+    });
     app.connect_activate(build);
     app.run()
 }
 
 fn build(app: &adw::Application) {
+    let background = LAUNCH_IN_BACKGROUND.swap(false, Ordering::Relaxed);
+    // The guard releases the hold when dropped. Closing the window hides it,
+    // so this process has to stay up and keep watching the daemon.
+    std::mem::forget(app.hold());
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("iCloud Drive")
         .default_width(720)
         .default_height(640)
+        .hide_on_close(true)
         .build();
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let header = adw::HeaderBar::new();
@@ -171,6 +194,20 @@ fn build(app: &adw::Application) {
     let open_folder = gtk::Button::with_label("Open iCloud Drive");
     content.append(&open_folder);
 
+    let startup_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    let startup_label = gtk::Label::new(Some("Start when you log in"));
+    startup_label.set_hexpand(true);
+    startup_label.set_xalign(0.0);
+    let startup = gtk::Switch::new();
+    startup.set_active(autostart_is_enabled());
+    startup_row.append(&startup_label);
+    startup_row.append(&startup);
+    content.append(&startup_row);
+    let startup_note = gtk::Label::new(Some(STARTUP_NOTE));
+    startup_note.set_xalign(0.0);
+    startup_note.set_wrap(true);
+    content.append(&startup_note);
+
     let scroll = gtk::ScrolledWindow::new();
     scroll.set_vexpand(true);
     scroll.set_child(Some(&content));
@@ -217,6 +254,8 @@ fn build(app: &adw::Application) {
         allow_deletion,
         start: start.clone(),
         quit: quit.clone(),
+        crash_alerted: Cell::new(false),
+        seen_service: Cell::new(false),
         folder_path,
         folder_list,
         sync_roots,
@@ -320,6 +359,20 @@ fn build(app: &adw::Application) {
     start.connect_clicked(|_| {
         std::thread::spawn(start_daemon);
     });
+    let startup_note_row = startup_note.clone();
+    startup.connect_state_set(move |switch, enabled| {
+        match set_autostart(enabled) {
+            Ok(()) => {
+                startup_note_row.set_text(STARTUP_NOTE);
+                false.into()
+            }
+            Err(_) => {
+                startup_note_row.set_text("Could not save the login setting.");
+                switch.set_state(!enabled);
+                true.into()
+            }
+        }
+    });
 
     let back_browser = std::sync::Arc::clone(&browser);
     folder_back.connect_clicked(move |_| {
@@ -365,15 +418,19 @@ fn build(app: &adw::Application) {
     let tick_widgets = Rc::clone(&widgets);
     let browser_ui = std::sync::Arc::clone(&browser);
     let rx = Rc::new(RefCell::new(rx));
+    let alert_app = app.clone();
+    let alert_window = window.clone();
     glib::timeout_add_local(Duration::from_millis(300), move || {
         let mut poll = None;
         let mut searches = Vec::new();
         let mut auths = Vec::new();
         let mut folders = None;
         let mut activity = None;
+        let mut crashed = false;
         while let Ok(msg) = rx.borrow_mut().try_recv() {
             match msg {
                 UiMsg::Poll(update) => poll = Some(update),
+                UiMsg::Crashed => crashed = true,
                 UiMsg::Search(hits) => searches.push(hits),
                 UiMsg::Auth(message) => auths.push(message),
                 UiMsg::Folders(update) => folders = Some(update),
@@ -383,20 +440,28 @@ fn build(app: &adw::Application) {
         if let Some(update) = poll {
             match update {
                 Some((status, attention, allow)) => {
+                    tick_widgets.crash_alerted.set(false);
+                    tick_widgets.seen_service.set(true);
                     tick_widgets.start.set_visible(false);
                     tick_widgets.quit.set_visible(true);
                     apply_status(&tick_widgets, &status, &attention, allow)
                 }
                 None => {
-                    tick_widgets.start.set_visible(true);
-                    tick_widgets.quit.set_visible(false);
-                    tick_widgets.status.set_text("Sync service is stopped");
-                    tick_widgets.detail.set_text("Press Start to run it again. ~/iCloud Drive stays where it is.");
-                    tick_widgets.hold_login.set(false);
-                    tick_widgets.auth.set_visible(false);
-                    tick_widgets.progress.set_fraction(0.0);
-                    tick_widgets.progress.set_text(Some(""));
+                    show_stopped(&tick_widgets);
+                    if tick_widgets.seen_service.replace(false) && !alert_window.is_visible() {
+                        alert_window.present();
+                    }
                 }
+            }
+        }
+        if crashed {
+            show_stopped(&tick_widgets);
+            if !tick_widgets.crash_alerted.get() {
+                tick_widgets.crash_alerted.set(true);
+                let note = gio::Notification::new("iCloud Drive stopped");
+                note.set_body(Some("Sync stopped. Press Start to run it again."));
+                alert_app.send_notification(Some("daemon-stopped"), &note);
+                alert_window.present();
             }
         }
         if let Some((path, choices, roots)) = folders {
@@ -414,7 +479,11 @@ fn build(app: &adw::Application) {
         ControlFlow::Continue
     });
 
-    window.present();
+    if background {
+        std::thread::spawn(start_daemon);
+    } else {
+        window.present();
+    }
 }
 
 fn section_label(text: &str) -> gtk::Label {
@@ -685,18 +754,87 @@ fn set_sync_folder(path: &str, enabled: bool) {
 }
 
 fn start_daemon() {
-    let started = std::process::Command::new("systemctl")
-        .args(["--user", "start", "icloud-drive.service"])
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false);
-    if started {
-        return;
+    if std::env::var_os("FLATPAK_ID").is_none() {
+        let started = std::process::Command::new("systemctl")
+            .args(["--user", "start", "icloud-drive.service"])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if started {
+            return;
+        }
     }
-    let binary = std::env::var("HOME")
-        .map(|home| std::path::PathBuf::from(home).join(".local/bin/icloud-drive"))
-        .unwrap_or_else(|_| std::path::PathBuf::from("icloud-drive"));
+    let binary = daemon_binary();
     let _ = std::process::Command::new(binary).arg("daemon").spawn();
+}
+
+fn daemon_binary() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|dir| dir.join("icloud-drive")))
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            std::env::var("HOME").ok().map(|home| std::path::PathBuf::from(home).join(".local/bin/icloud-drive"))
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from("icloud-drive"))
+}
+
+fn autostart_dir() -> std::path::PathBuf {
+    if std::env::var_os("FLATPAK_ID").is_some() {
+        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".config/autostart")
+    } else if let Some(config) = std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
+        std::path::PathBuf::from(config).join("autostart")
+    } else {
+        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".config/autostart")
+    }
+}
+
+fn autostart_path() -> std::path::PathBuf {
+    autostart_dir().join("dev.icloud_drive.Gui.desktop")
+}
+
+fn autostart_command() -> String {
+    if let Ok(id) = std::env::var("FLATPAK_ID") {
+        format!("flatpak run --command=icloud-drive-gui {id} --background")
+    } else {
+        let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("icloud-drive-gui"));
+        format!("{} --background", desktop_quote(&exe.display().to_string()))
+    }
+}
+
+fn desktop_quote(arg: &str) -> String {
+    if arg.contains([' ', '\t', '"', '\\']) {
+        format!("\"{}\"", arg.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        arg.to_string()
+    }
+}
+
+fn autostart_desktop(command: &str) -> String {
+    format!(
+        "[Desktop Entry]\nType=Application\nName=iCloud Drive\nComment=Keep chosen iCloud Drive folders in sync\nExec={command}\nIcon=dev.icloud_drive.Gui\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"
+    )
+}
+
+fn autostart_is_enabled() -> bool {
+    std::fs::read_to_string(autostart_path())
+        .ok()
+        .is_some_and(|text| !text.lines().any(|line| line.trim() == "Hidden=true"))
+}
+
+fn set_autostart(enabled: bool) -> std::io::Result<()> {
+    let path = autostart_path();
+    if !enabled {
+        match std::fs::remove_file(&path) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        }
+    } else {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, autostart_desktop(&autostart_command()))
+    }
 }
 
 fn fill_folders(
@@ -907,10 +1045,30 @@ type PollUpdate = Option<(StatusSnapshot, Vec<AttentionSnapshot>, bool)>;
 
 enum UiMsg {
     Poll(PollUpdate),
+    /// The daemon disappeared without the clean quit signal.
+    Crashed,
     Search(Vec<icloud_ipc::SearchHit>),
     Auth(String),
     Folders((String, Vec<icloud_ipc::FolderChoice>, Vec<String>)),
     Activity(Vec<icloud_ipc::ActivityEvent>),
+}
+
+const STARTUP_NOTE: &str = "Starts sync at login with this window hidden. The panel icon opens it. If sync stops on its own, the window opens so you can press Start.";
+
+/// A crash is a daemon that was running and did not emit the clean quit signal.
+fn unexpected_stop(ever_connected: bool, clean_quit: bool) -> bool {
+    ever_connected && !clean_quit
+}
+
+fn show_stopped(widgets: &Widgets) {
+    widgets.start.set_visible(true);
+    widgets.quit.set_visible(false);
+    widgets.status.set_text("Sync service is stopped");
+    widgets.detail.set_text("Press Start to run it again. ~/iCloud Drive stays where it is.");
+    widgets.hold_login.set(false);
+    widgets.auth.set_visible(false);
+    widgets.progress.set_fraction(0.0);
+    widgets.progress.set_text(Some(""));
 }
 
 async fn watch_service(tx: std::sync::mpsc::Sender<UiMsg>, browser: std::sync::Arc<std::sync::Mutex<String>>) {
@@ -933,9 +1091,14 @@ async fn watch_service(tx: std::sync::mpsc::Sender<UiMsg>, browser: std::sync::A
             tokio::time::sleep(Duration::from_millis(700)).await;
             continue;
         };
+        let mut ever_connected = false;
+        let mut clean_quit = false;
         loop {
             let update = read_status(&proxy).await;
             let connected = update.is_some();
+            if connected {
+                ever_connected = true;
+            }
             if tx.send(UiMsg::Poll(update)).is_err() {
                 return;
             }
@@ -957,6 +1120,7 @@ async fn watch_service(tx: std::sync::mpsc::Sender<UiMsg>, browser: std::sync::A
                 _ = closing.next() => true,
             };
             if closed {
+                clean_quit = true;
                 let _ = tx.send(UiMsg::Poll(None));
                 break;
             }
@@ -964,7 +1128,23 @@ async fn watch_service(tx: std::sync::mpsc::Sender<UiMsg>, browser: std::sync::A
                 break;
             }
         }
+        if unexpected_stop(ever_connected, clean_quit) {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if !service_is_up().await && tx.send(UiMsg::Crashed).is_err() {
+                return;
+            }
+        }
     }
+}
+
+async fn service_is_up() -> bool {
+    let Ok(connection) = zbus::Connection::session().await else {
+        return false;
+    };
+    let Ok(proxy) = ServiceProxy::new(&connection).await else {
+        return false;
+    };
+    proxy.status().await.is_ok()
 }
 
 async fn read_status(proxy: &ServiceProxy<'_>) -> PollUpdate {
@@ -976,7 +1156,7 @@ async fn read_status(proxy: &ServiceProxy<'_>) -> PollUpdate {
 
 #[cfg(test)]
 mod tests {
-    use super::{hold_after_sign_in, login_visible};
+    use super::{autostart_desktop, desktop_quote, hold_after_sign_in, login_visible, unexpected_stop};
 
     #[test]
     fn login_stays_hidden_while_a_sync_is_running() {
@@ -995,6 +1175,23 @@ mod tests {
         assert!(!login_visible("downloading", hold));
         let hold = hold_after_sign_in(hold, "needs_auth", false);
         assert!(login_visible("needs_auth", hold));
+    }
+
+    #[test]
+    fn login_autostart_hides_the_window_and_starts_sync() {
+        let text = autostart_desktop("flatpak run --command=icloud-drive-gui dev.icloud_drive.Gui --background");
+        assert!(text.contains("Exec=flatpak run --command=icloud-drive-gui dev.icloud_drive.Gui --background"));
+        assert!(text.contains("X-GNOME-Autostart-enabled=true"));
+        assert_eq!(desktop_quote("/home/pika/.local/bin/icloud-drive-gui"), "/home/pika/.local/bin/icloud-drive-gui");
+        assert_eq!(desktop_quote("/home/a b/icloud-drive-gui"), "\"/home/a b/icloud-drive-gui\"");
+    }
+
+    #[test]
+    fn a_clean_quit_does_not_alert() {
+        assert!(!unexpected_stop(false, true));
+        assert!(!unexpected_stop(true, true));
+        assert!(!unexpected_stop(false, false));
+        assert!(unexpected_stop(true, false));
     }
 }
 

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=iCloud Drive
+Comment=Keep chosen iCloud Drive folders on this computer
+Exec=icloud-drive-gui
+Icon=dev.icloud_drive.Gui
+Terminal=false
+Type=Application
+Categories=Network;FileTransfer;
+StartupNotify=true

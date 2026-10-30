@@ -1163,7 +1163,7 @@ dependencies = [
 
 [[package]]
 name = "icloud-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "dirs",
@@ -1181,7 +1181,7 @@ dependencies = [
 
 [[package]]
 name = "icloud-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "icloud-proto",
  "rusqlite",
@@ -1194,7 +1194,7 @@ dependencies = [
 
 [[package]]
 name = "icloud-gui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "futures-util",
  "gtk4",
@@ -1206,7 +1206,7 @@ dependencies = [
 
 [[package]]
 name = "icloud-ipc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "zbus",
@@ -1214,7 +1214,7 @@ dependencies = [
 
 [[package]]
 name = "icloud-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",

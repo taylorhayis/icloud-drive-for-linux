@@ -1,0 +1,38 @@
+id: dev.icloud_drive.Gui
+runtime: org.gnome.Platform
+runtime-version: "49"
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: icloud-drive-gui
+finish-args:
+  - --share=network
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --talk-name=org.freedesktop.Notifications
+  - --talk-name=org.kde.StatusNotifierWatcher
+  - --own-name=dev.icloud_drive.Gui
+  - --own-name=dev.icloud_drive.Service
+  - --own-name=org.kde.StatusNotifierItem.*
+  - --filesystem=home
+  - --filesystem=xdg-config/autostart:create
+modules:
+  - name: icloud-drive
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/icloud-drive/cargo
+      build-args:
+        - --share=network
+    build-commands:
+      - cargo build --release --locked
+      - install -Dm755 target/release/icloud-drive -t /app/bin
+      - install -Dm755 target/release/icloud-drive-gui -t /app/bin
+      - install -Dm644 packaging/dev.icloud_drive.Gui.desktop -t /app/share/applications
+      - install -Dm644 packaging/dev.icloud_drive.Gui.metainfo.xml -t /app/share/metainfo
+      - install -Dm644 packaging/dev.icloud_drive.Gui.svg /app/share/icons/hicolor/scalable/apps/dev.icloud_drive.Gui.svg
+    sources:
+      - type: dir
+        path: ..
